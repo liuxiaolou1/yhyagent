@@ -375,6 +375,108 @@ class TestModelGatewayAndSwitching(unittest.TestCase):
             deleted_again = client.delete("/api/v1/models/minimax/MiniMax-M3.1-Flash")
             self.assertEqual(deleted_again.status_code, 404)
 
+    def test_gateway_sse_stream_with_chunked_tool_calls_and_usage(self) -> None:
+        """验证上游 OpenAI 兼容 SSE 流式解析：含分片 tool_calls 组装、逐字文本增量、真实 usage 与错误回滚。"""
+        call_index = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_index
+            body = json.loads(request.content.decode("utf-8"))
+            self.assertTrue(body.get("stream"))
+            if body.get("model") == "bad-stream-model":
+                return httpx.Response(404, json={"error": {"message": "model not found"}})
+
+            call_index += 1
+            if call_index == 1:
+                # 第 1 轮：流式分片返回 remember 工具调用
+                sse_body = (
+                    'data: {"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_s1","type":"function","function":{"name":"remember","arguments":"{\\"content\\": \\"用户叫"}}]}}]}\n\n'
+                    'data: {"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"游鸿运\\", \\"scope\\": \\"profile\\"}"}}]}}]}\n\n'
+                    'data: {"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":15,"completion_tokens":10,"total_tokens":25}}\n\n'
+                    "data: [DONE]\n\n"
+                )
+            else:
+                # 第 2 轮：流式逐字返回最终文本回复
+                sse_body = (
+                    'data: {"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"好的，"}}]}\n\n'
+                    'data: {"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"已记住你的名字！"}}]}\n\n'
+                    'data: {"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":30,"completion_tokens":8,"total_tokens":38}}\n\n'
+                    "data: [DONE]\n\n"
+                )
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=sse_body.encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from app.adapters.tools import RememberTool
+
+            base = Path(tmpdir)
+            mem_store = InMemoryMemoryStore(user_id="yhy")
+            gateway = ModelGateway(
+                settings=_make_settings(),
+                default_provider="deepseek",
+                offline=False,
+                usage_store=LocalFileUsageStore(base, user_id="yhy"),
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            )
+            service = AgentService(
+                model_client=gateway,
+                session_store=InMemorySessionStore(),
+                tool_reviewer=PolicyToolReviewer(),
+                tools=[RememberTool(mem_store, user_id="yhy")],
+                user_id="yhy",
+                memory_store=mem_store,
+            )
+            client = TestClient(create_app(service, gateway.default_label, gateway=gateway))
+
+            with client.stream(
+                "POST",
+                "/api/sessions/stream_live/messages/stream",
+                json={"content": "我叫游鸿运", "provider": "deepseek", "model": "deepseek-v4-pro"},
+            ) as resp:
+                self.assertEqual(resp.status_code, 200)
+                raw = "".join(resp.iter_text())
+
+            events = []
+            for frame in raw.split("\n\n"):
+                if not frame.strip():
+                    continue
+                ev = ""
+                dt = ""
+                for line in frame.splitlines():
+                    if line.startswith("event:"):
+                        ev = line[6:].strip()
+                    elif line.startswith("data:"):
+                        dt += line[5:].strip()
+                events.append((ev, json.loads(dt)))
+
+            tool_events = [d for n, d in events if n == "tool"]
+            self.assertEqual(len(tool_events), 1)
+            self.assertEqual(tool_events[0]["tool_name"], "remember")
+            self.assertTrue(tool_events[0]["success"])
+
+            deltas = [d["content"] for n, d in events if n == "delta"]
+            self.assertEqual(deltas, ["好的，", "已记住你的名字！"])
+            self.assertEqual(events[-1][0], "done")
+            self.assertEqual(events[-1][1]["last_model"], "deepseek/deepseek-v4-pro")
+
+            # 验证真实流式 usage 已累计到 context-usage
+            cu = client.get("/api/sessions/stream_live/context-usage").json()
+            self.assertEqual(cu["usage_source"], "reported")
+            self.assertEqual(cu["last_prompt_tokens"], 30)
+            self.assertEqual(cu["cumulative_total_tokens"], 63)
+
+            # 验证流式遇到不存在模型返回 event: error 并回滚孤立用户消息
+            with client.stream(
+                "POST",
+                "/api/sessions/stream_live/messages/stream",
+                json={"content": "测坏模型", "provider": "deepseek", "model": "bad-stream-model"},
+            ) as bad_resp:
+                self.assertEqual(bad_resp.status_code, 200)
+                bad_raw = "".join(bad_resp.iter_text())
+            self.assertIn("event: error", bad_raw)
+            self.assertIn("MODEL_UNAVAILABLE", bad_raw)
+            sess_after = client.get("/api/sessions/stream_live").json()
+            self.assertFalse(any(m["content"] == "测坏模型" for m in sess_after["messages"]))
+
 
 if __name__ == "__main__":
     unittest.main()

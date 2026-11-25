@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -25,7 +27,7 @@ from pydantic import BaseModel
 from app.adapters.llm.mock_client import MockModelClient
 from app.adapters.llm.openai_client import OpenAIModelClient
 from app.config import ProviderEndpoint, Settings
-from app.domain import AgentContext, ModelResponse
+from app.domain import AgentContext, ModelResponse, ToolCall
 
 from .errors import GatewayError, connection_category, extract_upstream_message, provider_failure
 from .model_registry import CustomModelConfig, InMemoryModelRegistry
@@ -554,6 +556,287 @@ class ModelGateway:
             model_name=f"{target.provider}/{returned_model}",
             usage=usage,
         )
+
+    async def generate_stream(
+        self,
+        context: AgentContext,
+        *,
+        on_delta: Callable[[str], Awaitable[None] | None] | None = None,
+    ) -> ModelResponse:
+        """流式调用模型：实时回调文本增量 on_delta，并在结束时返回完整 ModelResponse（含流式 tool_calls 组装）。"""
+        target = self.resolve_target(context.provider, context.model)
+        request_id = f"req_{uuid.uuid4().hex[:12]}"
+
+        async def _emit(text: str) -> None:
+            if not text or on_delta is None:
+                return
+            res = on_delta(text)
+            if inspect.isawaitable(res):
+                await res
+
+        if target.offline:
+            req_hash = self._hash_payload({"session_id": context.session_id, "messages": len(context.messages), "stream": True})
+            record = await self._reserve_or_raise(
+                user_id=context.user_id,
+                session_id=context.session_id,
+                request_id=request_id,
+                request_hash=req_hash,
+                provider="offline",
+                model="offline",
+            )
+            response = await self._mock_client.generate(context)
+            if not response.tool_calls and response.content:
+                step = 12
+                for idx in range(0, len(response.content), step):
+                    await _emit(response.content[idx : idx + step])
+                    await asyncio.sleep(0)
+            await self.usage_store.finish(record.id, "succeeded", usage=response.usage or None, upstream_status=200)
+            return response
+
+        payload: dict[str, Any] = {
+            "model": target.model,
+            "temperature": 0.2,
+            "messages": OpenAIModelClient._serialize_messages(context),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if context.tools:
+            payload["tools"] = [OpenAIModelClient._serialize_tool(t) for t in context.tools]
+            payload["tool_choice"] = "auto"
+
+        assert target.endpoint is not None
+        endpoint = target.endpoint
+        req_hash = self._hash_payload({"provider": target.provider, "model": target.model, "payload": payload})
+        record = await self._reserve_or_raise(
+            user_id=context.user_id,
+            session_id=context.session_id,
+            request_id=request_id,
+            request_hash=req_hash,
+            provider=target.provider,
+            model=target.model,
+        )
+
+        url = f"{endpoint.base_url.rstrip('/')}/chat/completions"
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "X-Request-ID": request_id,
+        }
+        if endpoint.api_key:
+            headers["Authorization"] = f"Bearer {endpoint.api_key}"
+
+        content_parts: list[str] = []
+        tool_call_buffers: dict[int, dict[str, str]] = {}
+        reported_usage: dict[str, int] = {}
+        returned_model = target.model
+        complete = False
+
+        try:
+            async with self._semaphore:
+                if self._injected_http_client is not None:
+                    stream_ctx = self._injected_http_client.stream("POST", url, json=payload, headers=headers)
+                    async with stream_ctx as resp:
+                        complete, returned_model = await self._consume_openai_sse(
+                            resp,
+                            target=target,
+                            record_id=record.id,
+                            content_parts=content_parts,
+                            tool_call_buffers=tool_call_buffers,
+                            reported_usage=reported_usage,
+                            emit=_emit,
+                        )
+                else:
+                    async with httpx.AsyncClient(timeout=self.settings.gateway.upstream_timeout) as client:
+                        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                            complete, returned_model = await self._consume_openai_sse(
+                                resp,
+                                target=target,
+                                record_id=record.id,
+                                content_parts=content_parts,
+                                tool_call_buffers=tool_call_buffers,
+                                reported_usage=reported_usage,
+                                emit=_emit,
+                            )
+
+            tool_calls = self._finalize_streamed_tool_calls(tool_call_buffers)
+            finished_ok = complete or bool(content_parts) or bool(tool_calls)
+            await self.usage_store.finish(
+                record.id,
+                "succeeded" if finished_ok else "unknown",
+                usage=reported_usage or None,
+                error_code=None if finished_ok else "OUTCOME_UNKNOWN",
+                upstream_status=200,
+            )
+            if not finished_ok:
+                raise GatewayError(
+                    502,
+                    "OUTCOME_UNKNOWN",
+                    f"厂商 `{target.provider}` 流式响应提前结束且未返回有效内容。",
+                    provider=target.provider,
+                    model=target.model,
+                )
+
+            return ModelResponse(
+                content="".join(content_parts),
+                tool_calls=tool_calls,
+                model_name=f"{target.provider}/{returned_model}",
+                usage=reported_usage,
+            )
+        except GatewayError:
+            raise
+        except httpx.ConnectError as exc:
+            category = connection_category(exc)
+            logger.warning(
+                "gateway_stream_connect_failed request_id=%s provider=%s host=%s category=%s",
+                request_id,
+                target.provider,
+                urlsplit(url).hostname,
+                category,
+            )
+            await self.usage_store.finish(record.id, "failed", error_code="UPSTREAM_UNREACHABLE")
+            raise GatewayError(
+                503,
+                "UPSTREAM_UNREACHABLE",
+                f"无法连接到厂商 `{target.provider}`（类别：{category}），请检查本机网络或代理配置；网关未自动重试。",
+                provider=target.provider,
+                model=target.model,
+            ) from exc
+        except (httpx.HTTPError, ValueError, asyncio.CancelledError) as exc:
+            await asyncio.shield(
+                self.usage_store.finish(
+                    record.id,
+                    "unknown",
+                    usage=reported_usage or None,
+                    error_code="OUTCOME_UNKNOWN",
+                )
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise GatewayError(
+                502,
+                "OUTCOME_UNKNOWN",
+                f"厂商 `{target.provider}`（模型 `{target.model}`）流式传输中断或响应异常，未自动重发。",
+                provider=target.provider,
+                model=target.model,
+            ) from exc
+
+    async def _consume_openai_sse(
+        self,
+        resp: httpx.Response,
+        *,
+        target: ResolvedTarget,
+        record_id: str,
+        content_parts: list[str],
+        tool_call_buffers: dict[int, dict[str, str]],
+        reported_usage: dict[str, int],
+        emit: Callable[[str], Awaitable[None]],
+    ) -> tuple[bool, str]:
+        if resp.status_code != 200:
+            await resp.aread()
+            detail = extract_upstream_message(resp)
+            failure = provider_failure(
+                resp.status_code,
+                provider=target.provider,
+                model=target.model,
+                upstream_detail=detail,
+            )
+            await self.usage_store.finish(
+                record_id,
+                "failed",
+                error_code=failure.code,
+                upstream_status=resp.status_code,
+            )
+            raise failure
+
+        complete = False
+        returned_model = target.model
+        async for raw_line in resp.aiter_lines():
+            line = raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            value = line[5:].strip()
+            if not value:
+                continue
+            if value == "[DONE]":
+                complete = True
+                break
+            data = json.loads(value)
+            if not isinstance(data, dict):
+                raise ValueError("invalid provider SSE event")
+            if data.get("error"):
+                err_obj = data["error"]
+                msg = err_obj.get("message", "") if isinstance(err_obj, dict) else str(err_obj)
+                raise GatewayError(
+                    502,
+                    "UPSTREAM_ERROR",
+                    f"厂商 `{target.provider}` 流式返回错误：{msg[:180]}",
+                    provider=target.provider,
+                    model=target.model,
+                )
+            if isinstance(data.get("model"), str) and data["model"].strip():
+                returned_model = data["model"].strip()
+            chunk_usage = normalize_usage(data.get("usage"))
+            if chunk_usage:
+                reported_usage.update(chunk_usage)
+
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                complete = True
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+
+            piece = delta.get("content")
+            if isinstance(piece, str) and piece:
+                content_parts.append(piece)
+                await emit(piece)
+
+            raw_calls = delta.get("tool_calls")
+            if isinstance(raw_calls, list):
+                for item in raw_calls:
+                    if not isinstance(item, dict):
+                        continue
+                    idx = int(item.get("index", 0))
+                    buf = tool_call_buffers.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if isinstance(item.get("id"), str) and item["id"]:
+                        buf["id"] = item["id"]
+                    fn = item.get("function")
+                    if isinstance(fn, dict):
+                        if isinstance(fn.get("name"), str) and fn["name"]:
+                            buf["name"] += fn["name"]
+                        if isinstance(fn.get("arguments"), str) and fn["arguments"]:
+                            buf["arguments"] += fn["arguments"]
+
+        return complete, returned_model
+
+    @staticmethod
+    def _finalize_streamed_tool_calls(buffers: dict[int, dict[str, str]]) -> list[ToolCall]:
+        parsed: list[ToolCall] = []
+        for idx in sorted(buffers.keys()):
+            item = buffers[idx]
+            name = item.get("name") or "unknown"
+            raw_args = item.get("arguments") or "{}"
+            try:
+                args = json.loads(raw_args) if raw_args.strip() else {}
+                if not isinstance(args, dict):
+                    args = {"_raw": raw_args}
+            except json.JSONDecodeError:
+                args = {"_raw": raw_args}
+            parsed.append(
+                ToolCall(
+                    id=item.get("id") or ToolCall(name=name).id,
+                    name=name,
+                    arguments=args,
+                )
+            )
+        return parsed
 
     async def invoke_chat_passthrough(
         self,

@@ -589,7 +589,16 @@ function renderConversation() {
     }
   }
   if (tools.length) rows.push(toolDetails(tools));
-  if (state.pending) rows.push(assistantMessage("正在处理…", true));
+  if (state.pending) {
+    if (state.streamTools?.length) rows.push(toolDetails(state.streamTools));
+    if (state.streamText) {
+      const live = assistantMessage(state.streamText, false, "");
+      live.dataset.streaming = "true";
+      rows.push(live);
+    } else {
+      rows.push(assistantMessage("正在处理…", true));
+    }
+  }
   conversation.replaceChildren(...rows);
   elements.viewport.scrollTop = elements.viewport.scrollHeight;
 }
@@ -652,6 +661,77 @@ async function selectSession(id, focus = true) {
   }
 }
 
+function formatStreamToolContent(ev) {
+  if (!ev.approved) return `[REJECTED] ${ev.summary || "审核未通过"}`;
+  if (!ev.success) return `[ERROR] ${ev.summary || "执行失败"}`;
+  return ev.summary || "";
+}
+
+async function consumeSSE(path, payload, handlers) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    let data = {};
+    try {
+      data = await response.json();
+    } catch {
+      // 非 JSON 错误体
+    }
+    const error = new Error(data.error || "请求失败。");
+    error.status = response.status;
+    throw error;
+  }
+  if (!response.body) {
+    throw new Error("浏览器不支持流式响应读取。");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+
+  const dispatchFrame = (rawFrame) => {
+    let eventName = "message";
+    const dataLines = [];
+    for (const line of rawFrame.split(/\r?\n/)) {
+      if (!line || line.startsWith(":")) continue;
+      if (line.startsWith("event:")) {
+        eventName = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    if (!dataLines.length) return;
+    const dataText = dataLines.join("\n");
+    let parsed = dataText;
+    try {
+      parsed = JSON.parse(dataText);
+    } catch {
+      // 保留纯文本
+    }
+    handlers[eventName]?.(parsed);
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() || "";
+    for (const frame of frames) {
+      if (frame.trim()) dispatchFrame(frame);
+    }
+    if (done) {
+      if (buffer.trim()) dispatchFrame(buffer);
+      break;
+    }
+  }
+}
+
 async function sendMessage(event) {
   event.preventDefault();
   const content = elements.prompt.value.trim();
@@ -664,6 +744,8 @@ async function sendMessage(event) {
   const id = previous?.id || `sess_${crypto.randomUUID()}`;
   const messages = previous?.messages || [];
   state.pending = true;
+  state.streamText = "";
+  state.streamTools = [];
   state.active = {
     id,
     title: previous?.title || Array.from(content).slice(0, 40).join(""),
@@ -675,14 +757,52 @@ async function sendMessage(event) {
   renderConversation();
   updateComposer();
 
+  let streamCycle = 0;
+  let streamError = null;
+  let finished = false;
   try {
-    state.active = await request(`${sessionPath(id)}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content, provider: activeModel.provider, model: activeModel.model }),
-    });
-    storeSummary(state.active);
-    rememberSession(id);
+    await consumeSSE(
+      `${sessionPath(id)}/messages/stream`,
+      { content, provider: activeModel.provider, model: activeModel.model },
+      {
+        delta(data) {
+          if (typeof data?.cycle === "number" && data.cycle !== streamCycle) {
+            streamCycle = data.cycle;
+            state.streamText = "";
+          }
+          if (typeof data?.content === "string" && data.content) {
+            state.streamText += data.content;
+            renderConversation();
+          }
+        },
+        tool(data) {
+          state.streamTools.push({
+            role: "tool",
+            tool_name: data?.tool_name || "工具",
+            content: formatStreamToolContent(data || {}),
+          });
+          state.streamText = "";
+          renderConversation();
+        },
+        done(session) {
+          state.active = session;
+          storeSummary(state.active);
+          rememberSession(id);
+          finished = true;
+        },
+        error(data) {
+          const err = new Error(data?.error || "本轮处理未完成，请重试。");
+          err.status = data?.status || 502;
+          streamError = err;
+        },
+      },
+    );
+    if (streamError) throw streamError;
+    if (!finished) {
+      const err = new Error("流式响应提前中断。");
+      err.status = 0;
+      throw err;
+    }
   } catch (error) {
     state.active = previous;
     showError(error.status ? error.message : "连接中断，正在检查消息是否已保存…");
@@ -704,6 +824,8 @@ async function sendMessage(event) {
     }
   } finally {
     state.pending = false;
+    state.streamText = "";
+    state.streamTools = [];
     void refreshContextUsage(true);
     renderHistory();
     renderConversation();

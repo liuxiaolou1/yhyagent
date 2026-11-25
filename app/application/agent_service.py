@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Iterable
+from collections.abc import AsyncIterator
+from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
@@ -411,6 +413,170 @@ class AgentService:
             model_name=last_model_name,
             tool_events=tool_events,
         )
+
+    async def run_turn_stream(
+        self,
+        user_input: str,
+        *,
+        session_id: str | None = None,
+        user_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """流式执行单轮决策循环：实时产出 session / delta / tool / done 事件，并保持持续落盘与快照一致。"""
+        session = await self.session_store.get(session_id) if session_id else None
+        if session is None:
+            session = Session(
+                id=session_id or Session().id,
+                user_id=user_id or self.user_id,
+                title=user_input[:40],
+            )
+        else:
+            if user_id:
+                session.user_id = user_id
+            if not session.title:
+                session.title = user_input[:40]
+
+        snapshot = session.create_snapshot(label=f"before_turn:{user_input[:20]}")
+        session.append(Message.user(user_input))
+        await self.session_store.save(session)
+
+        yield {
+            "event": "session",
+            "data": {"session_id": session.id, "snapshot_id": snapshot.id},
+        }
+
+        guard = LoopGuard(max_repeat_calls=self.max_repeat_calls)
+        tool_specs = [t.spec for t in self._tools.values()]
+        tool_events: list[ToolEvent] = []
+        last_model_name = ""
+
+        for cycle in range(1, self.max_cycles + 1):
+            await self._maybe_compress_context(session)
+            memory_context = await self._load_memory_context(session.user_id)
+            active_messages = list(session.messages[session.summarized_until :])
+            latest_summary = session.latest_summary.content if session.latest_summary else ""
+
+            logger.info(
+                "[Session %s | Cycle %d/%d] 流式请求模型决策 (provider=%s, model=%s)...",
+                session.id,
+                cycle,
+                self.max_cycles,
+                provider or "default",
+                model or "default",
+            )
+            context = AgentContext(
+                session_id=session.id,
+                user_id=session.user_id,
+                provider=provider,
+                model=model,
+                instruction=self.instruction,
+                summary=latest_summary,
+                memory_context=memory_context,
+                messages=active_messages,
+                tools=tool_specs,
+                cycle=cycle,
+                max_cycles=self.max_cycles,
+                max_history_messages=self.max_history_messages,
+            )
+
+            stream_fn = getattr(self.model_client, "generate_stream", None)
+            if callable(stream_fn):
+                queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+                async def _on_delta(chunk: str) -> None:
+                    await queue.put(("delta", chunk))
+
+                async def _produce() -> None:
+                    try:
+                        resp = await stream_fn(context, on_delta=_on_delta)
+                        await queue.put(("response", resp))
+                    except BaseException as exc:  # noqa: BLE001
+                        await queue.put(("error", exc))
+
+                producer = asyncio.create_task(_produce())
+                response = None
+                try:
+                    while True:
+                        kind, payload = await queue.get()
+                        if kind == "delta":
+                            yield {"event": "delta", "data": {"cycle": cycle, "content": payload}}
+                        elif kind == "response":
+                            response = payload
+                            break
+                        elif kind == "error":
+                            raise payload
+                finally:
+                    if not producer.done():
+                        producer.cancel()
+                        try:
+                            await producer
+                        except asyncio.CancelledError:
+                            pass
+            else:
+                response = await self.model_client.generate(context)
+                if response.content and not response.tool_calls:
+                    yield {"event": "delta", "data": {"cycle": cycle, "content": response.content}}
+
+            assert response is not None
+            if response.model_name:
+                last_model_name = response.model_name
+                session.metadata["last_model"] = response.model_name
+            _record_session_usage(session, response.usage)
+
+            session.append(
+                Message.assistant(
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                    model_name=response.model_name or None,
+                )
+            )
+            await self.session_store.save(session)
+
+            if not response.tool_calls:
+                logger.info("[Session %s | Cycle %d] 流式输出完成，本轮结束。", session.id, cycle)
+                result = TurnResult(
+                    session_id=session.id,
+                    reply=response.content,
+                    cycles=cycle,
+                    stopped_reason="completed",
+                    snapshot_id=snapshot.id,
+                    model_name=last_model_name,
+                    tool_events=tool_events,
+                )
+                yield {"event": "done", "data": result.model_dump(mode="json")}
+                return
+
+            for tool_call in response.tool_calls:
+                tool_result = await self._handle_tool_call(session, tool_call, guard)
+                session.append(Message.tool(tool_result))
+                await self.session_store.save(session)
+
+                ev = ToolEvent(
+                    cycle=cycle,
+                    tool_name=tool_call.name,
+                    arguments=tool_call.arguments,
+                    approved=tool_result.approved,
+                    success=tool_result.success,
+                    summary=tool_result.output if tool_result.success else (tool_result.error or ""),
+                )
+                tool_events.append(ev)
+                yield {"event": "tool", "data": ev.model_dump(mode="json")}
+
+        limit_reply = f"已达到最大循环次数上限（{self.max_cycles} 轮），本轮决策自动结束。你可以继续补充指令接着聊。"
+        session.append(Message.assistant(content=limit_reply, model_name=last_model_name or None))
+        await self.session_store.save(session)
+        yield {"event": "delta", "data": {"cycle": self.max_cycles, "content": limit_reply}}
+        result = TurnResult(
+            session_id=session.id,
+            reply=limit_reply,
+            cycles=self.max_cycles,
+            stopped_reason="max_cycles",
+            snapshot_id=snapshot.id,
+            model_name=last_model_name,
+            tool_events=tool_events,
+        )
+        yield {"event": "done", "data": result.model_dump(mode="json")}
 
     async def _load_memory_context(self, user_id: str) -> str:
         if self.memory_store is None:

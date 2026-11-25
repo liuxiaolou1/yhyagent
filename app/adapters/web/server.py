@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.adapters.gateway import GatewayError, ModelDescriptor, ModelGateway, UsageRecord
@@ -488,6 +490,86 @@ def create_app(
         if session is None:
             raise ApiError(500, "处理完成后未找到会话。")
         return session_detail(session)
+
+    @app.post("/api/sessions/{session_id}/messages/stream")
+    async def post_message_stream(session_id: str, payload: SendMessageRequest) -> StreamingResponse:
+        prompt = payload.content.strip()
+        if not prompt:
+            raise ApiError(400, "请输入有效的消息内容。")
+
+        if not NEW_SESSION_ID.fullmatch(session_id) and await _get_session_safe(session_id) is None:
+            raise ApiError(400, "会话标识无效。")
+
+        if active_gateway is not None:
+            active_gateway.resolve_target(payload.provider, payload.model)
+
+        if turn_lock.locked():
+            raise ApiError(409, "Agent 正在处理另一条消息，请稍后发送。")
+
+        def _sse(event_name: str, data: dict[str, Any]) -> bytes:
+            return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        async def _event_generator() -> AsyncIterator[bytes]:
+            async with turn_lock:
+                existing_before = await _get_session_safe(session_id)
+                prev_msg_count = len(existing_before.messages) if existing_before else 0
+                try:
+                    async for item in service.run_turn_stream(
+                        prompt,
+                        session_id=session_id,
+                        provider=payload.provider,
+                        model=payload.model,
+                    ):
+                        ev_name = item["event"]
+                        ev_data = item["data"]
+                        if ev_name == "done":
+                            final_session = await service.get_session(ev_data["session_id"])
+                            if final_session is None:
+                                yield _sse("error", {"error": "处理完成后未找到会话。", "code": "SESSION_MISSING", "status": 500})
+                                return
+                            yield _sse("done", session_detail(final_session).model_dump(mode="json"))
+                        else:
+                            yield _sse(ev_name, ev_data)
+                except GatewayError as exc:
+                    current = await _get_session_safe(session_id)
+                    if (
+                        current is not None
+                        and len(current.messages) == prev_msg_count + 1
+                        and current.snapshots
+                    ):
+                        await service.rollback_session(session_id, current.snapshots[-1].id)
+                    yield _sse(
+                        "error",
+                        {
+                            "error": exc.message,
+                            "code": exc.code,
+                            "provider": exc.provider,
+                            "model": exc.model,
+                            "status": exc.status,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("流式处理会话消息失败: %s", exc)
+                    yield _sse(
+                        "error",
+                        {
+                            "error": "本轮处理未完成，请检查模型连接后重试。",
+                            "code": "STREAM_ERROR",
+                            "status": 502,
+                        },
+                    )
+
+        return StreamingResponse(
+            _event_generator(),
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/sessions/{session_id}/rollback", response_model=SessionDetailResponse)
     async def rollback_session(session_id: str, payload: RollbackRequest) -> SessionDetailResponse:

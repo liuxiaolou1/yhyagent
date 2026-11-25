@@ -181,6 +181,43 @@ class TestFastAPIWebBackend(unittest.TestCase):
             )
             self.assertEqual(bad_origin.status_code, 403)
 
+    def test_sse_stream_endpoint_offline_events_and_headers(self) -> None:
+        """验证 SSE 流式接口返回标准事件序列、Nginx 防缓冲响应头与最终完整会话落盘。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self._make_client(tmpdir)
+            with client.stream(
+                "POST",
+                "/api/sessions/sse_01/messages/stream",
+                json={"content": "帮我处理异常订单 ORD-1001"},
+            ) as resp:
+                self.assertEqual(resp.status_code, 200)
+                self.assertIn("text/event-stream", resp.headers["content-type"])
+                self.assertEqual(resp.headers.get("x-accel-buffering"), "no")
+                raw = "".join(resp.iter_text())
+
+            frames = [f.strip() for f in raw.split("\n\n") if f.strip()]
+            events: list[tuple[str, dict]] = []
+            for frame in frames:
+                ev_name = ""
+                data_str = ""
+                for line in frame.splitlines():
+                    if line.startswith("event:"):
+                        ev_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_str += line[5:].strip()
+                events.append((ev_name, __import__("json").loads(data_str)))
+
+            names = [e[0] for e in events]
+            self.assertIn("session", names)
+            self.assertIn("tool", names)
+            self.assertIn("delta", names)
+            self.assertEqual(names[-1], "done")
+
+            streamed_text = "".join(d["content"] for n, d in events if n == "delta")
+            done_session = events[-1][1]
+            self.assertEqual(done_session["id"], "sse_01")
+            self.assertEqual(done_session["messages"][-1]["content"], streamed_text)
+
 
 if __name__ == "__main__":
     unittest.main()
