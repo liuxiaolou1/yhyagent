@@ -1,0 +1,810 @@
+const elements = Object.fromEntries(
+  Array.from(document.querySelectorAll("[id]"), (element) => [element.id, element]),
+);
+const state = { active: null, sessions: [], pending: false, loading: false, historyError: "" };
+const contextUsage = { key: null, controller: null, failed: false };
+const mobile = window.matchMedia("(max-width: 700px)");
+let selection = 0;
+
+const providerNames = {
+  openai: "OpenAI",
+  gemini: "Google Gemini",
+  qwen: "通义千问",
+  deepseek: "DeepSeek",
+  glm: "智谱 GLM",
+};
+const knownProviders = {
+  dashscope: { label: "阿里云百炼", icon: "qwen" },
+  deepseek: { label: "DeepSeek", icon: "deepseek" },
+  glm: { label: "智谱 GLM", icon: "glm" },
+  gemini: { label: "Google Gemini", icon: "gemini" },
+  openai: { label: "OpenAI", icon: "openai" },
+  default: { label: "默认配置", icon: "local" },
+  offline: { label: "离线模式", icon: "local" },
+};
+const modelStorageKey = "myagent.model-preferences";
+const modelPreferences = readModelPreferences();
+const lastModelByProvider = new Map();
+let catalog = [];
+let modelGroups = new Map();
+let modelOffline = false;
+let catalogReady = false;
+let catalogError = "";
+let openPanel = "";
+let modelMutationPending = false;
+let modelToDelete = null;
+
+function node(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function readModelPreferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(modelStorageKey));
+    if (typeof saved?.selected === "string") {
+      return { provider: saved.provider || "", selected: saved.selected };
+    }
+  } catch {
+    // 本地存储不可用时仍可在当前页面选择模型。
+  }
+  return { provider: "", selected: "" };
+}
+
+function rememberModel(provider, id = "") {
+  modelPreferences.provider = provider;
+  modelPreferences.selected = id;
+  if (id) lastModelByProvider.set(provider, id);
+  try {
+    localStorage.setItem(modelStorageKey, JSON.stringify(modelPreferences));
+  } catch {
+    // 浏览器可能禁用本地存储。
+  }
+}
+
+function selectedModel() {
+  return catalog.find((model) => model.id === modelPreferences.selected && model.available);
+}
+
+function firstAvailable(models) {
+  return models.find((model) => model.available && model.is_default) || models.find((model) => model.available);
+}
+
+function setCatalog(models, preferredId = "") {
+  if (!Array.isArray(models)) throw new Error("服务返回的模型列表格式有误。");
+  catalogReady = true;
+  catalogError = "";
+  catalog = models;
+  modelGroups = new Map();
+  for (const model of catalog) {
+    if (!modelGroups.has(model.provider)) {
+      const meta = Object.hasOwn(knownProviders, model.provider) ? knownProviders[model.provider] : null;
+      modelGroups.set(model.provider, {
+        id: model.provider,
+        label: meta?.label || model.vendor_label || model.provider,
+        icon: model.provider === "default" ? model.vendor : meta?.icon || model.vendor,
+        models: [],
+      });
+    }
+    modelGroups.get(model.provider).models.push(model);
+  }
+
+  const preferred = catalog.find((model) => model.id === preferredId);
+  const saved = catalog.find((model) => model.id === modelPreferences.selected);
+  const group = modelGroups.get(preferred?.provider || saved?.provider || modelPreferences.provider);
+  const candidate = (preferred?.available && preferred)
+    || (!preferred && saved?.available && saved)
+    || firstAvailable(group?.models || []);
+  const keepGroup = preferred || (group && !modelPreferences.selected);
+  const fallback = keepGroup ? null : firstAvailable(catalog);
+  const active = candidate || fallback;
+  rememberModel(active?.provider || group?.id || catalog[0]?.provider || "", active?.id);
+  renderModelPicker();
+}
+
+function renderProviderIcon(icon, provider) {
+  const hasMark = Object.hasOwn(providerNames, provider);
+  icon.classList.toggle("local-icon", !hasMark);
+  icon.setAttribute("aria-hidden", "true");
+  icon.replaceChildren();
+  if (!hasMark) return;
+  const namespace = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(namespace, "svg");
+  const use = document.createElementNS(namespace, "use");
+  use.setAttribute("href", "#provider-" + provider);
+  svg.append(use);
+  icon.append(svg);
+}
+
+function pickerOption({ title, subtitle, icon, pressed, disabled, choose }) {
+  const button = node("button", "model-option");
+  button.type = "button";
+  button.disabled = Boolean(disabled);
+  button.setAttribute("aria-pressed", String(pressed));
+  if (icon) {
+    const mark = node("span", "provider-icon");
+    renderProviderIcon(mark, icon);
+    button.append(mark);
+  }
+  const text = node("span", "model-option-text");
+  text.append(node("span", "model-option-name", title));
+  if (subtitle) text.append(node("span", "model-option-provider", subtitle));
+  button.append(text);
+  button.addEventListener("click", choose);
+  return button;
+}
+
+function setNotice(id, message = "") {
+  const box = elements[id];
+  box.textContent = message;
+  box.hidden = !message;
+}
+
+function renderModelPicker() {
+  const group = modelGroups.get(modelPreferences.provider);
+  const model = selectedModel();
+  const models = group?.models || [];
+  const vendorLabel = group?.label || "厂商";
+  const modelLabel = model?.name || (catalogReady ? "选择模型" : "正在加载");
+  elements["provider-trigger-label"].textContent = vendorLabel;
+  elements["provider-trigger"].setAttribute("aria-label", "选择厂商，当前：" + vendorLabel);
+  elements["provider-trigger"].title = vendorLabel;
+  renderProviderIcon(elements["provider-trigger-icon"], group?.icon || "local");
+  elements["model-trigger-label"].textContent = modelLabel;
+  elements["model-trigger"].setAttribute("aria-label", "选择模型，当前：" + modelLabel);
+  elements["model-trigger"].title = modelLabel;
+  elements["model-panel-note"].textContent = modelOffline ? "离线模式" : "";
+
+  const providers = [...modelGroups.values()].map((item) => pickerOption({
+    title: item.label,
+    subtitle: item.models.some((entry) => entry.available) ? "" : "暂无可用模型",
+    icon: item.icon,
+    pressed: item.id === group?.id,
+    choose: () => chooseProvider(item),
+  }));
+  const rows = models.map((item) => {
+    const row = node("div", "model-option-row");
+    row.append(pickerOption({
+      title: item.name,
+      subtitle: item.available ? "" : modelOffline ? "离线模式下不可用" : "连接未就绪",
+      icon: item.vendor,
+      pressed: item.id === model?.id,
+      disabled: !item.available,
+      choose: () => chooseModel(item),
+    }));
+    if (item.custom) {
+      const action = node("button", "delete-model");
+      action.type = "button";
+      action.title = "删除 " + item.name;
+      action.setAttribute("aria-label", action.title);
+      action.setAttribute("aria-haspopup", "dialog");
+      const mark = node("span", "trash-icon");
+      mark.setAttribute("aria-hidden", "true");
+      action.append(mark);
+      action.addEventListener("click", () => confirmDeleteModel(item));
+      row.append(action);
+    }
+    return row;
+  });
+  elements["provider-options"].replaceChildren(...providers);
+  elements["model-options"].replaceChildren(...rows);
+  const loadingMessage = catalogReady ? "暂无模型" : "正在加载…";
+  setNotice("provider-empty", providers.length ? "" : catalogError || loadingMessage);
+  setNotice("model-empty", rows.length ? "" : catalogError || loadingMessage);
+  if (catalogReady) {
+    const status = elements["model-status"];
+    const label = elements["model-label"];
+    status.dataset.state = catalogError ? "error" : modelOffline ? "offline" : model ? "live" : "error";
+    label.textContent = catalogError || model?.name || "暂无可用模型";
+    label.title = model?.id || label.textContent;
+  }
+  updateComposer();
+  void refreshContextUsage();
+}
+
+function setPickerPanel(name = "", returnFocus = "") {
+  if (name) setContextPopover(false);
+  openPanel = name;
+  for (const panel of ["provider", "model"]) {
+    elements[panel + "-panel"].hidden = panel !== name;
+    elements[panel + "-trigger"].setAttribute("aria-expanded", String(panel === name));
+  }
+  if (name) {
+    const list = elements[name + "-options"];
+    const focus = list.querySelector('[aria-pressed="true"]') || list.querySelector("button:not(:disabled)");
+    (focus || (name === "model" ? elements["open-add-model"] : elements["provider-trigger"])).focus();
+  }
+  if (returnFocus) elements[returnFocus + "-trigger"].focus();
+}
+
+function chooseProvider(group) {
+  const previous = lastModelByProvider.get(group.id);
+  const model = group.models.find((item) => item.id === previous && item.available) || firstAvailable(group.models);
+  rememberModel(group.id, model?.id);
+  setNotice("model-feedback");
+  renderModelPicker();
+  setPickerPanel("model");
+}
+
+function chooseModel(model) {
+  rememberModel(model.provider, model.id);
+  setNotice("model-feedback");
+  setPickerPanel("", "model");
+  renderModelPicker();
+}
+
+function updateModelForm() {
+  const custom = elements["model-provider"].value === "custom";
+  elements["custom-provider-field"].hidden = !custom;
+  elements["custom-provider"].required = custom;
+  if (custom) elements["model-connection"].open = true;
+  setNotice("model-error");
+}
+
+function openAddModel() {
+  const form = elements["model-form"];
+  const providerField = elements["model-provider"];
+  const group = modelGroups.get(modelPreferences.provider);
+  form.reset();
+  elements["model-connection"].open = false;
+  if (group && !["default", "offline"].includes(group.id)) {
+    providerField.value = Array.from(providerField.options).some((option) => option.value === group.id) ? group.id : "custom";
+    if (providerField.value === "custom") elements["custom-provider"].value = group.id;
+  }
+  updateModelForm();
+  if (group && !group.models.some((item) => item.available) && group.id !== "offline") {
+    elements["model-connection"].open = true;
+  }
+  setPickerPanel();
+  elements["model-dialog"].showModal();
+}
+
+function setModelMutation(dialog, pending) {
+  modelMutationPending = pending;
+  dialog.setAttribute("aria-busy", String(pending));
+  for (const field of dialog.querySelectorAll("button, select, input")) field.disabled = pending;
+}
+
+async function refreshAfterMutation(preferredId, notice) {
+  try {
+    const data = await request("/api/v1/models");
+    setCatalog(data.models, preferredId);
+  } catch {
+    notice += " 暂未同步完整列表，刷新页面可重新加载。";
+  }
+  setNotice("model-feedback", notice);
+}
+
+async function addModel(event) {
+  event.preventDefault();
+  if (modelMutationPending) return;
+  const dialog = elements["model-dialog"];
+  const picker = elements["model-provider"].value;
+  const custom = picker === "custom";
+  const provider = custom ? elements["custom-provider"].value.trim() : picker;
+  const model = elements["model-id"].value.trim();
+  if (!provider || !model) {
+    setNotice("model-error", "请填写厂商和模型 ID。");
+    return;
+  }
+  const group = modelGroups.get(provider);
+  const payload = {
+    provider,
+    model,
+    name: elements["model-name"].value.trim(),
+    vendor_label: custom ? group?.label || provider : "",
+    base_url: elements["custom-base-url"].value.trim(),
+    api_key: elements["custom-api-key"].value.trim(),
+  };
+  setNotice("model-error");
+  setModelMutation(dialog, true);
+  try {
+    const created = await request("/api/v1/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    setCatalog([...catalog.filter((item) => item.id !== created.id), created], created.id);
+    const notice = created.available ? "已保存模型。" : "已保存模型，当前连接未就绪。";
+    await refreshAfterMutation(created.id, notice);
+  } catch (error) {
+    if (error.status === 422) elements["model-connection"].open = true;
+    setNotice("model-error", error.status ? error.message : "保存失败，连接已中断，请重试。");
+    return;
+  } finally {
+    setModelMutation(dialog, false);
+  }
+  dialog.close();
+  setPickerPanel("model");
+}
+
+function confirmDeleteModel(model) {
+  modelToDelete = model;
+  elements["delete-description"].textContent = "将从当前模型列表移除「" + model.name + "」。";
+  setNotice("delete-error");
+  setPickerPanel();
+  elements["delete-dialog"].showModal();
+}
+
+async function deleteModel(event) {
+  event.preventDefault();
+  if (modelMutationPending || !modelToDelete) return;
+  const model = modelToDelete;
+  const dialog = elements["delete-dialog"];
+  setNotice("delete-error");
+  setModelMutation(dialog, true);
+  try {
+    await request("/api/v1/models/" + encodeURIComponent(model.id), { method: "DELETE" }).catch((error) => {
+      if (error.status !== 404) throw error;
+    });
+    setCatalog(catalog.filter((item) => item.id !== model.id));
+    await refreshAfterMutation("", "已移除模型。");
+  } catch (error) {
+    setNotice("delete-error", error.status ? error.message : "删除失败，连接已中断，请重试。");
+    return;
+  } finally {
+    setModelMutation(dialog, false);
+  }
+  modelToDelete = null;
+  dialog.close();
+  setPickerPanel("model");
+}
+
+async function request(path, options) {
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(data?.error || "请求失败。");
+    error.status = response.status;
+    throw error;
+  }
+  if (data === null) throw new Error("服务返回了无法读取的响应。");
+  return data;
+}
+
+function sessionPath(id) {
+  return `/api/sessions/${encodeURIComponent(id)}`;
+}
+
+function setContextPopover(open, restoreFocus = false) {
+  const trigger = elements["context-trigger"];
+  elements["context-popover"].hidden = !open;
+  trigger.setAttribute("aria-expanded", String(open));
+  if (restoreFocus) trigger.focus();
+}
+
+function renderContextUsage(message, percent = 0, percentLabel = "") {
+  elements["context-popover"].textContent = message;
+  elements["context-ring"].style.setProperty("--context-fill", `${Math.max(0, Math.min(100, percent))}%`);
+  elements["context-trigger"].setAttribute("aria-label", percentLabel ? `上下文使用量，已使用 ${percentLabel}` : "上下文使用量");
+}
+
+function compactTokens(tokens) {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
+  return String(tokens);
+}
+
+function displayContextReport(report, session, model) {
+  const useReported = report.usage_source === "reported"
+    && Number.isFinite(report.last_prompt_tokens)
+    && (!model || model.id === session.last_model);
+  const used = useReported ? report.last_prompt_tokens : report.estimated_context_tokens;
+  const limit = report.context_window_tokens;
+  const qualifier = useReported ? "" : "约 ";
+  if (!Number.isFinite(limit) || limit <= 0) {
+    renderContextUsage(`已使用 ${qualifier}${compactTokens(used)} tokens · 窗口未知`);
+    return;
+  }
+  const percent = (used / limit) * 100;
+  const percentLabel = percent > 0 && percent < 0.1 ? "<0.1%" : `${percent.toFixed(1)}%`;
+  renderContextUsage(`${qualifier}${percentLabel} · ${compactTokens(used)} / ${compactTokens(limit)} 上下文已使用`, percent, percentLabel);
+}
+
+async function refreshContextUsage(force = false) {
+  const session = state.loading ? null : state.active;
+  const model = selectedModel();
+  const key = state.loading ? null : session ? `${session.id}\0${model?.id || ""}` : "";
+  if (!force && key === contextUsage.key && !state.loading) return;
+
+  contextUsage.controller?.abort();
+  contextUsage.controller = null;
+  contextUsage.key = key;
+  contextUsage.failed = false;
+  if (!session || state.pending) {
+    renderContextUsage(state.loading || state.pending ? "正在更新上下文用量…" : "发送消息后显示上下文用量。");
+    return;
+  }
+
+  const controller = new AbortController();
+  contextUsage.controller = controller;
+  const query = model ? `?${new URLSearchParams({ model: model.id })}` : "";
+  renderContextUsage("正在更新上下文用量…");
+  try {
+    const report = await request(`${sessionPath(session.id)}/context-usage${query}`, { signal: controller.signal });
+    if (!controller.signal.aborted) displayContextReport(report, session, model);
+  } catch {
+    if (!controller.signal.aborted) {
+      contextUsage.failed = true;
+      renderContextUsage("暂时无法读取上下文用量。");
+    }
+  } finally {
+    if (contextUsage.controller === controller) contextUsage.controller = null;
+  }
+}
+
+function showError(text = "") {
+  elements.error.textContent = text;
+  elements.error.hidden = !text;
+}
+
+function rememberSession(id) {
+  const url = new URL(window.location.href);
+  url.hash = id ? encodeURIComponent(id) : "";
+  history.replaceState(null, "", url);
+}
+
+function setSidebar(open, restoreFocus = false) {
+  if (open) {
+    setPickerPanel();
+    setContextPopover(false);
+  }
+  elements.sidebar.dataset.open = String(open);
+  elements["open-sidebar"].setAttribute("aria-expanded", String(open));
+  elements.backdrop.hidden = !open;
+  elements.main.inert = open;
+  if (open) elements["close-sidebar"].focus();
+  if (restoreFocus) elements["open-sidebar"].focus();
+}
+
+function renderHistory() {
+  const empty = elements["empty-history"];
+  empty.hidden = state.sessions.length > 0;
+  empty.textContent = state.historyError || "暂无会话";
+  const items = state.sessions.map(({ id, title }) => {
+    const item = node("li");
+    const button = node("button", "session-button");
+    const icon = node("span", "bubble-icon");
+    icon.setAttribute("aria-hidden", "true");
+    button.type = "button";
+    button.title = title;
+    button.disabled = state.pending;
+    if (id === state.active?.id) button.setAttribute("aria-current", "true");
+    button.append(icon, node("span", "session-title", title));
+    button.addEventListener("click", () => selectSession(id));
+    item.append(button);
+    return item;
+  });
+  elements.sessions.replaceChildren(...items);
+}
+
+function storeSummary({ id, title }) {
+  state.sessions = [{ id, title }, ...state.sessions.filter((session) => session.id !== id)];
+}
+
+function appendInline(target, text) {
+  const tokens = /\*\*([^*\r\n]+)\*\*|`([^`\r\n]+)`|\[([^\]\r\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  let offset = 0;
+  for (const token of text.matchAll(tokens)) {
+    target.append(text.slice(offset, token.index));
+    if (token[1]) {
+      target.append(node("strong", "", token[1]));
+    } else if (token[2]) {
+      target.append(node("code", "", token[2]));
+    } else {
+      const link = node("a", "", token[3]);
+      link.href = token[4];
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      target.append(link);
+    }
+    offset = token.index + token[0].length;
+  }
+  target.append(text.slice(offset));
+}
+
+function renderReply(content) {
+  const reply = node("div", "reply");
+  const parts = content.split(/(?:^|\r?\n)```[^\r\n]*\r?\n([\s\S]*?)\r?\n```(?=\r?\n|$)/g);
+  parts.forEach((part, index) => {
+    if (index % 2) {
+      const code = node("pre");
+      code.append(node("code", "", part));
+      reply.append(code);
+    } else {
+      appendInline(reply, part);
+    }
+  });
+  return reply;
+}
+
+function assistantMessage(content, pending = false, modelName = "") {
+  const message = node("article", "message assistant");
+  const mark = node("span", "agent-mark");
+  mark.setAttribute("aria-hidden", "true");
+  message.setAttribute("aria-label", "MyAgent");
+  const reply = pending ? node("div", "pending", content) : renderReply(content);
+  if (pending) reply.setAttribute("role", "status");
+  if (!pending && modelName) {
+    reply.append(node("div", "reply-model", `模型：${modelName}`));
+  }
+  message.append(mark, reply);
+  return message;
+}
+
+function toolDetails(messages) {
+  const details = node("details", "tools");
+  details.append(node("summary", "", `工具记录（${messages.length}）`));
+  const list = node("ul", "tool-list");
+  for (const message of messages) {
+    const item = node("li");
+    const content = message.content;
+    let status = "已完成";
+    let kind = "success";
+    if (content.startsWith("[REJECTED]")) {
+      status = "已拦截";
+      kind = "rejected";
+    } else if (content.startsWith("[ERROR]")) {
+      status = "执行失败";
+      kind = "failed";
+    }
+    item.append(
+      node("code", "", message.tool_name || "工具"),
+      node("span", `tool-state ${kind}`, status),
+      node("p", "", content.replace(/^\[(REJECTED|ERROR)\]\s*/, "")),
+    );
+    list.append(item);
+  }
+  details.append(list);
+  return details;
+}
+
+function renderConversation() {
+  const messages = state.active?.messages || [];
+  const conversation = elements.conversation;
+  elements.welcome.hidden = messages.length > 0;
+  conversation.hidden = messages.length === 0;
+  elements["chat-title"].textContent = state.active?.title || "新对话";
+
+  const rows = [];
+  let tools = [];
+  for (const message of messages) {
+    if (message.role === "tool") {
+      tools.push(message);
+      continue;
+    }
+    if (message.intermediate) continue;
+    if (tools.length) {
+      rows.push(toolDetails(tools));
+      tools = [];
+    }
+    if (message.role === "user") {
+      const row = node("article", "message user", message.content);
+      row.setAttribute("aria-label", "你");
+      rows.push(row);
+    } else if (message.role === "assistant" && message.content) {
+      rows.push(assistantMessage(message.content, false, message.model_name || ""));
+    }
+  }
+  if (tools.length) rows.push(toolDetails(tools));
+  if (state.pending) rows.push(assistantMessage("正在处理…", true));
+  conversation.replaceChildren(...rows);
+  elements.viewport.scrollTop = elements.viewport.scrollHeight;
+}
+
+function updateComposer() {
+  const busy = state.pending || state.loading;
+  elements.prompt.readOnly = busy;
+  elements.send.disabled = busy || !selectedModel() || !elements.prompt.value.trim();
+  elements.send.textContent = state.pending ? "处理中" : "发送";
+  elements["new-chat"].disabled = state.pending;
+  elements["open-add-model"].disabled = state.pending || !catalogReady;
+  for (const button of elements["model-options"].querySelectorAll(".delete-model")) {
+    button.disabled = state.pending;
+  }
+}
+
+function newChat() {
+  selection += 1;
+  state.loading = false;
+  state.active = null;
+  setContextPopover(false);
+  void refreshContextUsage();
+  elements.prompt.value = "";
+  rememberSession();
+  setSidebar(false);
+  showError();
+  renderHistory();
+  renderConversation();
+  updateComposer();
+  elements.prompt.focus();
+}
+
+async function selectSession(id, focus = true) {
+  const current = ++selection;
+  state.loading = true;
+  setContextPopover(false);
+  void refreshContextUsage();
+  setSidebar(false);
+  showError();
+  updateComposer();
+  try {
+    const session = await request(sessionPath(id));
+    if (current !== selection) return;
+    if (state.active?.id !== id) elements.prompt.value = "";
+    state.active = session;
+    rememberSession(id);
+    renderHistory();
+    renderConversation();
+  } catch (error) {
+    if (current !== selection) return;
+    if (!state.active && error.status === 404) rememberSession();
+    showError(error.status ? error.message : "暂时无法加载会话，请重试。");
+  } finally {
+    if (current === selection) {
+      state.loading = false;
+      void refreshContextUsage();
+      updateComposer();
+      if (focus) elements.prompt.focus();
+    }
+  }
+}
+
+async function sendMessage(event) {
+  event.preventDefault();
+  const content = elements.prompt.value.trim();
+  const activeModel = selectedModel();
+  if (!content || !activeModel || state.pending || state.loading) return;
+  setPickerPanel();
+  setContextPopover(false);
+
+  const previous = state.active;
+  const id = previous?.id || `sess_${crypto.randomUUID()}`;
+  const messages = previous?.messages || [];
+  state.pending = true;
+  state.active = {
+    id,
+    title: previous?.title || Array.from(content).slice(0, 40).join(""),
+    messages: [...messages, { role: "user", content }],
+  };
+  elements.prompt.value = "";
+  showError();
+  renderHistory();
+  renderConversation();
+  updateComposer();
+
+  try {
+    state.active = await request(`${sessionPath(id)}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content, provider: activeModel.provider, model: activeModel.model }),
+    });
+    storeSummary(state.active);
+    rememberSession(id);
+  } catch (error) {
+    state.active = previous;
+    showError(error.status ? error.message : "连接中断，正在检查消息是否已保存…");
+    let saved = false;
+    if (!error.status || error.status === 502) {
+      const session = await request(sessionPath(id)).catch(() => null);
+      const newMessages = session?.messages.slice(messages.length) || [];
+      saved = newMessages.some((message) => message.role === "user" && message.content === content);
+      if (saved) {
+        state.active = session;
+        storeSummary(session);
+        rememberSession(id);
+        if (!error.status) showError("连接中断，已重新加载会话。");
+      }
+    }
+    if (!saved) {
+      elements.prompt.value = content;
+      if (!error.status) showError("连接中断，请确认本地服务正在运行后重试。");
+    }
+  } finally {
+    state.pending = false;
+    void refreshContextUsage(true);
+    renderHistory();
+    renderConversation();
+    updateComposer();
+    if (elements.sidebar.dataset.open !== "true") elements.prompt.focus();
+  }
+}
+
+elements.composer.addEventListener("submit", sendMessage);
+elements.prompt.addEventListener("input", updateComposer);
+elements.prompt.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault();
+    if (!elements.send.disabled) elements.composer.requestSubmit();
+  }
+});
+for (const name of ["provider", "model"]) {
+  elements[name + "-trigger"].addEventListener("click", () => setPickerPanel(openPanel === name ? "" : name));
+}
+elements["model-picker"].addEventListener("focusout", (event) => {
+  if (event.relatedTarget && !elements["model-picker"].contains(event.relatedTarget)) setPickerPanel();
+});
+elements["model-picker"].addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && openPanel) {
+    event.preventDefault();
+    setPickerPanel("", openPanel);
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (openPanel && !elements["model-picker"].contains(event.target)) setPickerPanel();
+  if (!elements["context-usage"].contains(event.target)) setContextPopover(false);
+});
+elements["context-trigger"].addEventListener("click", () => {
+  const open = elements["context-popover"].hidden;
+  if (open) setPickerPanel();
+  setContextPopover(open);
+  if (open && contextUsage.failed) void refreshContextUsage(true);
+});
+elements["open-add-model"].addEventListener("click", openAddModel);
+elements["model-provider"].addEventListener("change", updateModelForm);
+elements["model-form"].addEventListener("submit", addModel);
+elements["cancel-model"].addEventListener("click", () => elements["model-dialog"].close());
+elements["delete-form"].addEventListener("submit", deleteModel);
+elements["cancel-delete"].addEventListener("click", () => {
+  modelToDelete = null;
+  elements["delete-dialog"].close();
+});
+for (const id of ["model-dialog", "delete-dialog"]) {
+  const dialog = elements[id];
+  dialog.addEventListener("cancel", (event) => {
+    if (modelMutationPending) event.preventDefault();
+  });
+  dialog.addEventListener("close", () => {
+    if (dialog.open) return;
+    if (id === "model-dialog") elements["custom-api-key"].value = "";
+    if (!openPanel && !elements["model-dialog"].open && !elements["delete-dialog"].open) {
+      elements["model-trigger"].focus();
+    }
+  });
+}
+elements["new-chat"].addEventListener("click", newChat);
+elements["open-sidebar"].addEventListener("click", () => setSidebar(true));
+elements["close-sidebar"].addEventListener("click", () => setSidebar(false, true));
+elements.backdrop.addEventListener("click", () => setSidebar(false, true));
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!elements["context-popover"].hidden) setContextPopover(false, true);
+  if (elements.sidebar.dataset.open === "true") setSidebar(false, true);
+});
+mobile.addEventListener("change", () => setSidebar(false));
+
+async function loadHistory() {
+  try {
+    const sessions = await request("/api/sessions");
+    const known = new Set(state.sessions.map(({ id }) => id));
+    state.sessions.push(...sessions.filter(({ id }) => !known.has(id)));
+  } catch {
+    state.historyError = "无法加载会话，刷新后重试。";
+  }
+  renderHistory();
+}
+
+async function loadStatus() {
+  try {
+    const data = await request("/api/status");
+    modelOffline = data.models.some((item) => item.provider === "offline");
+    setCatalog(data.models);
+  } catch {
+    catalogReady = true;
+    catalogError = "模型列表加载失败";
+    renderModelPicker();
+  }
+}
+
+let availableId = "";
+try {
+  availableId = decodeURIComponent(window.location.hash.slice(1));
+} catch {
+  rememberSession();
+}
+if (availableId) selectSession(availableId, false);
+renderModelPicker();
+loadHistory();
+loadStatus();
