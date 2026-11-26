@@ -2,6 +2,7 @@
 
 from .builtin import (
     DeleteOrderTool,
+    LoadSkillTool,
     QueryOrderTool,
     RememberTool,
     SearchMemoryTool,
@@ -14,6 +15,7 @@ __all__ = [
     "DeleteOrderTool",
     "RememberTool",
     "SearchMemoryTool",
+    "LoadSkillTool",
     "TavilySearchTool",
     "build_default_tools",
 ]

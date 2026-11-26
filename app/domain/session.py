@@ -78,3 +78,21 @@ class Session(BaseModel):
         self.summaries = [s for s in self.summaries if s.covered_until <= target.message_count]
         self.updated_at = datetime.now(timezone.utc)
         return target
+
+
+class SideChat(BaseModel):
+    """从主会话分叉出的独立侧边问答分支（只读可见主会话历史，单独落盘，绝不写回主会话）。"""
+
+    id: str = Field(default_factory=lambda: f"side_{uuid4().hex[:10]}")
+    parent_session_id: str
+    user_id: str = "default"
+    title: str = ""
+    quote: str = ""
+    messages: list[Message] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def append(self, message: Message) -> None:
+        self.messages.append(message)
+        self.updated_at = datetime.now(timezone.utc)

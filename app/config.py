@@ -67,13 +67,14 @@ class LoopSettings(BaseModel):
 
 
 class ContextSettings(BaseModel):
-    """本地按用户/日期记忆与上下文滚动压缩配置。"""
+    """本地按用户/日期记忆、上下文滚动压缩与自定义扩展预算配置。"""
 
     default_user_id: str = "default"
     compress_trigger_messages: int = Field(default=24, ge=4)
     compress_trigger_chars: int = Field(default=12000, ge=500)
     compress_keep_recent: int = Field(default=10, ge=2)
     memory_recent_days: int = Field(default=2, ge=0)
+    customization_token_budget: int = Field(default=20000, ge=100)
 
 
 class GatewaySettings(BaseModel):
@@ -212,6 +213,7 @@ class Settings(BaseModel):
             compress_trigger_chars=int(os.getenv("COMPRESS_TRIGGER_CHARS", "12000")),
             compress_keep_recent=int(os.getenv("COMPRESS_KEEP_RECENT", "10")),
             memory_recent_days=int(os.getenv("MEMORY_RECENT_DAYS", "2")),
+            customization_token_budget=int(os.getenv("CUSTOMIZATION_TOKEN_BUDGET", "20000")),
         )
 
         llm_timeout = float(os.getenv("LLM_TIMEOUT", "60.0"))

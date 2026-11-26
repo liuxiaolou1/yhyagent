@@ -12,14 +12,25 @@ from app.adapters.gateway import (
 )
 from app.adapters.review import PolicyToolReviewer
 from app.adapters.storage import (
+    InMemoryCustomizationStore,
     InMemoryMemoryStore,
     InMemorySessionStore,
+    InMemorySideChatStore,
     JsonFileSessionStore,
+    JsonFileSideChatStore,
+    LocalFileCustomizationStore,
     LocalFileMemoryStore,
     MongoSessionStore,
 )
 from app.adapters.tools import build_default_tools
-from app.application import AgentService, ContextCompressor, MemoryStore, SessionStore
+from app.application import (
+    AgentService,
+    ContextCompressor,
+    CustomizationStore,
+    MemoryStore,
+    SessionStore,
+    SideChatStore,
+)
 from app.config import Settings
 
 
@@ -36,10 +47,14 @@ def build_agent_service(
     active_user = (user_id or settings.context.default_user_id or "default").strip() or "default"
 
     session_store: SessionStore
+    side_chat_store: SideChatStore
     memory_store: MemoryStore
+    customization_store: CustomizationStore
     if storage == "memory":
         session_store = InMemorySessionStore()
+        side_chat_store = InMemorySideChatStore(user_id=active_user)
         memory_store = InMemoryMemoryStore(user_id=active_user)
+        customization_store = InMemoryCustomizationStore(user_id=active_user)
         usage_store = InMemoryUsageStore(user_id=active_user)
         model_registry = InMemoryModelRegistry(user_id=active_user)
     elif storage == "mongo":
@@ -47,12 +62,16 @@ def build_agent_service(
             mongo_url=settings.infra.mongo_url,
             db_name=settings.infra.mongo_db,
         )
+        side_chat_store = JsonFileSideChatStore(base_dir=data_dir, user_id=active_user)
         memory_store = LocalFileMemoryStore(base_dir=data_dir, user_id=active_user)
+        customization_store = LocalFileCustomizationStore(base_dir=data_dir, user_id=active_user)
         usage_store = LocalFileUsageStore(base_dir=data_dir, user_id=active_user)
         model_registry = LocalFileModelRegistry(base_dir=data_dir, user_id=active_user)
     else:
         session_store = JsonFileSessionStore(base_dir=data_dir, user_id=active_user)
+        side_chat_store = JsonFileSideChatStore(base_dir=data_dir, user_id=active_user)
         memory_store = LocalFileMemoryStore(base_dir=data_dir, user_id=active_user)
+        customization_store = LocalFileCustomizationStore(base_dir=data_dir, user_id=active_user)
         usage_store = LocalFileUsageStore(base_dir=data_dir, user_id=active_user)
         model_registry = LocalFileModelRegistry(base_dir=data_dir, user_id=active_user)
 
@@ -76,10 +95,18 @@ def build_agent_service(
     service = AgentService(
         model_client=gateway,
         session_store=session_store,
+        side_chat_store=side_chat_store,
         tool_reviewer=PolicyToolReviewer(interactive=approve_interactive),
-        tools=build_default_tools(settings, memory_store=memory_store, user_id=active_user),
+        tools=build_default_tools(
+            settings,
+            memory_store=memory_store,
+            customization_store=customization_store,
+            user_id=active_user,
+        ),
         user_id=active_user,
         memory_store=memory_store,
+        customization_store=customization_store,
+        customization_token_budget=settings.context.customization_token_budget,
         context_compressor=context_compressor,
         max_cycles=settings.max_cycles,
         max_repeat_calls=settings.max_repeat_actions,

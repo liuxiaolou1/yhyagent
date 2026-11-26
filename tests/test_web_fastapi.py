@@ -218,6 +218,47 @@ class TestFastAPIWebBackend(unittest.TestCase):
             self.assertEqual(done_session["id"], "sse_01")
             self.assertEqual(done_session["messages"][-1]["content"], streamed_text)
 
+    def test_side_chat_stream_does_not_pollute_main_session(self) -> None:
+        """验证侧边追问 SSE 接口可独立流式回答，且绝不修改主会话消息数。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = self._make_client(tmpdir)
+            # 先建立一条主会话记录
+            main_resp = client.post(
+                "/api/sessions/main_s1/messages",
+                json={"content": "帮我处理异常订单 ORD-1001"},
+            )
+            self.assertEqual(main_resp.status_code, 200)
+            before_count = len(main_resp.json()["messages"])
+
+            # 在侧边追问里引用主会话片段并发起追问
+            with client.stream(
+                "POST",
+                "/api/side-chat/stream",
+                json={
+                    "question": "为什么高危操作要拦截？",
+                    "quote": "删除操作因高危风险已被审核拦截",
+                    "session_id": "main_s1",
+                    "history": [{"role": "user", "content": "先问一句"}, {"role": "assistant", "content": "好的"}],
+                },
+            ) as resp:
+                self.assertEqual(resp.status_code, 200)
+                self.assertIn("text/event-stream", resp.headers["content-type"])
+                self.assertEqual(resp.headers.get("x-accel-buffering"), "no")
+                raw = "".join(resp.iter_text())
+
+            self.assertIn("event: delta", raw)
+            self.assertIn("event: done", raw)
+            self.assertIn("为什么高危操作要拦截", raw)
+
+            # 验证主会话消息数完全没有被污染
+            after_main = client.get("/api/sessions/main_s1").json()
+            self.assertEqual(len(after_main["messages"]), before_count)
+
+            # 空问题返回 400
+            bad = client.post("/api/side-chat/stream", json={"question": "   "})
+            self.assertEqual(bad.status_code, 400)
+            self.assertIn("error", bad.json())
+
 
 if __name__ == "__main__":
     unittest.main()

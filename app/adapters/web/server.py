@@ -21,7 +21,14 @@ from app.adapters.gateway import GatewayError, ModelDescriptor, ModelGateway, Us
 from app.application import AgentService
 from app.bootstrap import build_agent_service
 from app.config import Settings
-from app.domain import ContextUsageReport, MemoryEntry, MemoryScope, Session
+from app.domain import (
+    ContextUsageReport,
+    CustomizationBudgetReport,
+    MemoryEntry,
+    MemoryScope,
+    Session,
+    SideChat,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +100,47 @@ class SendMessageRequest(BaseModel):
     content: str
     provider: str | None = None
     model: str | None = None
+
+
+class SideChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class SideChatRequest(BaseModel):
+    question: str
+    quote: str = ""
+    session_id: str | None = None
+    side_id: str | None = None
+    history: list[SideChatTurn] = Field(default_factory=list)
+    provider: str | None = None
+    model: str | None = None
+
+
+class SideChatSummaryResponse(BaseModel):
+    id: str
+    parent_session_id: str
+    title: str
+    quote: str = ""
+    last_model: str = ""
+    message_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class SideChatDetailResponse(BaseModel):
+    id: str
+    side_id: str
+    parent_session_id: str
+    title: str
+    quote: str = ""
+    last_model: str = ""
+    messages: list[MessageItemResponse] = Field(default_factory=list)
+
+
+class DeleteSideChatResponse(BaseModel):
+    deleted: bool
+    id: str
 
 
 class RollbackRequest(BaseModel):
@@ -192,6 +240,41 @@ def memory_item(entry: MemoryEntry) -> MemoryItemResponse:
     )
 
 
+def side_chat_summary(side_chat: SideChat) -> SideChatSummaryResponse:
+    return SideChatSummaryResponse(
+        id=side_chat.id,
+        parent_session_id=side_chat.parent_session_id,
+        title=side_chat.title or side_chat.id,
+        quote=side_chat.quote,
+        last_model=str(side_chat.metadata.get("last_model") or ""),
+        message_count=len(side_chat.messages),
+        created_at=side_chat.created_at,
+        updated_at=side_chat.updated_at,
+    )
+
+
+def side_chat_detail(side_chat: SideChat) -> SideChatDetailResponse:
+    return SideChatDetailResponse(
+        id=side_chat.id,
+        side_id=side_chat.id,
+        parent_session_id=side_chat.parent_session_id,
+        title=side_chat.title or side_chat.id,
+        quote=side_chat.quote,
+        last_model=str(side_chat.metadata.get("last_model") or ""),
+        messages=[
+            MessageItemResponse(
+                role=message.role.value,
+                content=message.content,
+                tool_name=message.tool_name,
+                model_name=message.model_name,
+                intermediate=bool(message.tool_calls),
+            )
+            for message in side_chat.messages
+            if message.role.value != "system"
+        ],
+    )
+
+
 def build_local_hosts(host: str, port: int) -> set[str] | None:
     """仅监听本机回环地址时启用 Host/Origin 校验，防止跨站访问本地 Agent。"""
     normalized = host.strip().lower()
@@ -227,6 +310,7 @@ def create_app(
     app.state.model_label = model_label
     app.state.gateway = active_gateway
     turn_lock = asyncio.Lock()
+    side_turn_lock = asyncio.Lock()
 
     @app.exception_handler(GatewayError)
     async def _handle_gateway_error(request: Request, exc: GatewayError) -> JSONResponse:
@@ -571,6 +655,132 @@ def create_app(
             },
         )
 
+    @app.get("/api/sessions/{session_id}/side-chats", response_model=list[SideChatSummaryResponse])
+    async def list_side_chats(session_id: str) -> list[SideChatSummaryResponse]:
+        items = await service.list_side_chats(session_id)
+        return [side_chat_summary(item) for item in items]
+
+    @app.get("/api/side-chats/{side_id}", response_model=SideChatDetailResponse)
+    async def get_side_chat(side_id: str) -> SideChatDetailResponse:
+        if not NEW_SESSION_ID.fullmatch(side_id):
+            raise ApiError(404, "侧边分支不存在。")
+        item = await service.get_side_chat(side_id)
+        if item is None:
+            raise ApiError(404, "侧边分支不存在。")
+        return side_chat_detail(item)
+
+    @app.delete("/api/side-chats/{side_id}", response_model=DeleteSideChatResponse)
+    async def delete_side_chat(side_id: str) -> DeleteSideChatResponse:
+        if not NEW_SESSION_ID.fullmatch(side_id):
+            raise ApiError(404, "侧边分支不存在。")
+        removed = await service.delete_side_chat(side_id)
+        if not removed:
+            raise ApiError(404, "侧边分支不存在。")
+        return DeleteSideChatResponse(deleted=True, id=side_id)
+
+    @app.post("/api/side-chat/stream")
+    async def side_chat_stream(payload: SideChatRequest) -> StreamingResponse:
+        """独立的侧边追问（Side Question / /btw）SSE 接口：
+        - 只读可见主会话历史与摘要，绝不写回主会话；
+        - 保留只读工具，物理级禁止 remember 与高危写操作；
+        - 单独分支落盘到 .data/<user>/side_chats/YYYY/MM/DD/<side_id>.json。
+        """
+        question = payload.question.strip()
+        if not question:
+            raise ApiError(400, "请输入要追问的内容。")
+
+        clean_side_id = (payload.side_id or "").strip() or None
+        if clean_side_id is not None and not NEW_SESSION_ID.fullmatch(clean_side_id):
+            raise ApiError(400, "侧边分支标识无效。")
+
+        if active_gateway is not None:
+            active_gateway.resolve_target(payload.provider, payload.model)
+
+        if side_turn_lock.locked():
+            raise ApiError(409, "侧边追问正在处理上一条消息，请稍后发送。")
+
+        seed_history = [(turn.role, turn.content) for turn in payload.history[-20:]]
+
+        def _sse(event_name: str, data: dict[str, Any]) -> bytes:
+            return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        async def _side_generator() -> AsyncIterator[bytes]:
+            async with side_turn_lock:
+                active_side_id = clean_side_id
+                existing_before = await service.get_side_chat(clean_side_id) if clean_side_id else None
+                prev_msg_count = len(existing_before.messages) if existing_before else 0
+                try:
+                    async for item in service.run_side_turn_stream(
+                        question,
+                        parent_session_id=payload.session_id,
+                        side_id=clean_side_id,
+                        quote=payload.quote,
+                        seed_history=seed_history,
+                        provider=payload.provider,
+                        model=payload.model,
+                    ):
+                        ev_name = item["event"]
+                        ev_data = item["data"]
+                        if ev_name == "session":
+                            active_side_id = ev_data.get("side_id") or active_side_id
+                            yield _sse(ev_name, ev_data)
+                        elif ev_name == "done":
+                            saved = await service.get_side_chat(ev_data["side_id"])
+                            done_payload: dict[str, Any] = {
+                                "reply": ev_data.get("reply", ""),
+                                "model_name": ev_data.get("model_name") or model_label,
+                                "side_id": ev_data["side_id"],
+                                "parent_session_id": ev_data["parent_session_id"],
+                            }
+                            if saved is not None:
+                                done_payload.update(side_chat_detail(saved).model_dump(mode="json"))
+                            yield _sse("done", done_payload)
+                        else:
+                            yield _sse(ev_name, ev_data)
+                except ValueError as exc:
+                    yield _sse("error", {"error": str(exc), "code": "INVALID_SIDE_CHAT", "status": 400})
+                except GatewayError as exc:
+                    if active_side_id and service.side_chat_store is not None:
+                        current = await service.get_side_chat(active_side_id)
+                        if current is not None and len(current.messages) == prev_msg_count + 1:
+                            if prev_msg_count == 0 and existing_before is None:
+                                await service.delete_side_chat(active_side_id)
+                            else:
+                                current.messages = current.messages[:prev_msg_count]
+                                await service.side_chat_store.save(current)
+                    yield _sse(
+                        "error",
+                        {
+                            "error": exc.message,
+                            "code": exc.code,
+                            "provider": exc.provider,
+                            "model": exc.model,
+                            "status": exc.status,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("侧边追问处理失败: %s", exc)
+                    yield _sse(
+                        "error",
+                        {
+                            "error": "侧边追问处理未完成，请稍后重试。",
+                            "code": "SIDE_CHAT_ERROR",
+                            "status": 502,
+                        },
+                    )
+
+        return StreamingResponse(
+            _side_generator(),
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/api/sessions/{session_id}/rollback", response_model=SessionDetailResponse)
     async def rollback_session(session_id: str, payload: RollbackRequest) -> SessionDetailResponse:
         snapshot_id = payload.snapshot_id.strip()
@@ -589,6 +799,11 @@ def create_app(
         if session is None:
             raise ApiError(404, "会话不存在。")
         return session_detail(session)
+
+    # ---- Customizations Token 预算监控与明细 ----
+    @app.get("/api/customizations/usage", response_model=CustomizationBudgetReport)
+    async def get_customizations_usage() -> CustomizationBudgetReport:
+        return await service.get_customization_usage()
 
     # ---- 长期记忆 API（按用户 + 日期本地文件） ----
     @app.get("/api/memories", response_model=MemoryListResponse)

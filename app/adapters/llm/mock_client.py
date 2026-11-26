@@ -21,6 +21,13 @@ class MockModelClient:
             m for m in context.messages[last_user_idx + 1 :] if m.role == Role.TOOL
         ]
 
+        # 无工具上下文（如侧边追问 / 纯问答模式）：直接返回离线文本回答
+        if not context.tools:
+            return ModelResponse(
+                content=f"（离线侧边回答）关于「{last_user_text}」，已结合引用片段与主会话背景给出说明。",
+                model_name="mock/offline",
+            )
+
         # 多轮续聊演示：如果是第 2+ 轮对话，直接引用历史上下文作答
         if len(user_messages) > 1 and not turn_tool_msgs:
             return ModelResponse(

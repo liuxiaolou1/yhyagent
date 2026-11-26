@@ -581,8 +581,24 @@ function renderConversation() {
       tools = [];
     }
     if (message.role === "user") {
-      const row = node("article", "message user", message.content);
+      const row = node("article", "message user");
       row.setAttribute("aria-label", "你");
+      const lines = String(message.content || "").split(/\r?\n/);
+      const quoteLines = [];
+      let idx = 0;
+      while (idx < lines.length && lines[idx].startsWith(">")) {
+        quoteLines.push(lines[idx].replace(/^>\s?/, ""));
+        idx += 1;
+      }
+      if (quoteLines.length && idx < lines.length && lines[idx].trim() === "") {
+        idx += 1;
+      }
+      if (quoteLines.length && idx < lines.length) {
+        row.append(node("blockquote", "user-quote", quoteLines.join("\n")));
+        row.append(document.createTextNode(lines.slice(idx).join("\n")));
+      } else {
+        row.textContent = message.content;
+      }
       rows.push(row);
     } else if (message.role === "assistant" && message.content) {
       rows.push(assistantMessage(message.content, false, message.model_name || ""));
@@ -621,6 +637,7 @@ function newChat() {
   state.active = null;
   setContextPopover(false);
   void refreshContextUsage();
+  void loadSideBranches("standalone");
   elements.prompt.value = "";
   rememberSession();
   setSidebar(false);
@@ -647,6 +664,7 @@ async function selectSession(id, focus = true) {
     rememberSession(id);
     renderHistory();
     renderConversation();
+    void loadSideBranches(id);
   } catch (error) {
     if (current !== selection) return;
     if (!state.active && error.status === 404) rememberSession();
@@ -734,11 +752,36 @@ async function consumeSSE(path, payload, handlers) {
 
 async function sendMessage(event) {
   event.preventDefault();
-  const content = elements.prompt.value.trim();
+  const rawPrompt = elements.prompt.value.trim();
+  const quoteText = (state.quote || "").trim();
   const activeModel = selectedModel();
-  if (!content || !activeModel || state.pending || state.loading) return;
+  if (!rawPrompt || !activeModel || state.pending || state.loading) return;
+
+  // 支持在主输入框直接输入 "/btw 问题" 快速打开侧边分支追问
+  if (/^\/btw(?:\s+|$)/i.test(rawPrompt)) {
+    const btwQuestion = rawPrompt.replace(/^\/btw\s*/i, "").trim();
+    elements.prompt.value = "";
+    if (quoteText) {
+      setSideQuote(quoteText);
+      setMainQuote("");
+    }
+    setSidePanel(true);
+    updateComposer();
+    if (btwQuestion) {
+      elements["side-prompt"].value = btwQuestion;
+      updateSideComposer();
+      elements["side-form"].requestSubmit();
+    }
+    return;
+  }
+
   setPickerPanel();
   setContextPopover(false);
+  hideSelectionToolbar();
+
+  const content = quoteText
+    ? `${quoteText.split(/\r?\n/).map((line) => `> ${line}`).join("\n")}\n\n${rawPrompt}`
+    : rawPrompt;
 
   const previous = state.active;
   const id = previous?.id || `sess_${crypto.randomUUID()}`;
@@ -746,9 +789,10 @@ async function sendMessage(event) {
   state.pending = true;
   state.streamText = "";
   state.streamTools = [];
+  setMainQuote("");
   state.active = {
     id,
-    title: previous?.title || Array.from(content).slice(0, 40).join(""),
+    title: previous?.title || Array.from(rawPrompt).slice(0, 40).join(""),
     messages: [...messages, { role: "user", content }],
   };
   elements.prompt.value = "";
@@ -819,7 +863,8 @@ async function sendMessage(event) {
       }
     }
     if (!saved) {
-      elements.prompt.value = content;
+      elements.prompt.value = rawPrompt;
+      if (quoteText) setMainQuote(quoteText);
       if (!error.status) showError("连接中断，请确认本地服务正在运行后重试。");
     }
   } finally {
@@ -832,6 +877,361 @@ async function sendMessage(event) {
     updateComposer();
     if (elements.sidebar.dataset.open !== "true") elements.prompt.focus();
   }
+}
+
+/* ---- 划词浮窗（Quote Ctrl+L / Side Question Ctrl+E）与侧边独立分支聊天 ---- */
+const sideState = {
+  open: false,
+  parentId: "standalone",
+  sideId: null,
+  branches: [],
+  quote: "",
+  messages: [],
+  pending: false,
+  streamText: "",
+  streamTools: [],
+};
+let activeSelectionText = "";
+let sideBranchReqSeq = 0;
+
+function currentParentSessionId() {
+  return state.active?.id || "standalone";
+}
+
+function setMainQuote(text) {
+  state.quote = (text || "").trim();
+  const hasQuote = Boolean(state.quote);
+  elements["quote-bar"].hidden = !hasQuote;
+  elements["quote-bar-text"].textContent = state.quote;
+}
+
+function setSideQuote(text) {
+  sideState.quote = (text || "").trim();
+  const hasQuote = Boolean(sideState.quote);
+  elements["side-quote-card"].hidden = !hasQuote;
+  elements["side-quote-text"].textContent = sideState.quote;
+}
+
+function showSideError(text = "") {
+  elements["side-error"].textContent = text;
+  elements["side-error"].hidden = !text;
+}
+
+function renderSideBranches() {
+  const select = elements["side-branch-select"];
+  const delBtn = elements["delete-side-branch"];
+  const options = [];
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = sideState.branches.length
+    ? `新分支（已有 ${sideState.branches.length} 个独立分支）`
+    : "新分支（自动独立落盘）";
+  options.push(blank);
+  for (const b of sideState.branches) {
+    const opt = document.createElement("option");
+    opt.value = b.id;
+    opt.textContent = `${b.title || b.id} (${b.message_count || 0})`;
+    options.push(opt);
+  }
+  select.replaceChildren(...options);
+  select.value = sideState.sideId || "";
+  select.disabled = sideState.pending;
+  delBtn.hidden = !sideState.sideId;
+  delBtn.disabled = sideState.pending;
+}
+
+function resetSideDraft(keepQuote = false) {
+  sideState.sideId = null;
+  sideState.messages = [];
+  sideState.streamText = "";
+  sideState.streamTools = [];
+  if (!keepQuote) setSideQuote("");
+  showSideError();
+  renderSideBranches();
+  renderSideConversation();
+  updateSideComposer();
+}
+
+async function loadSideBranches(parentId = currentParentSessionId(), selectSideId = "") {
+  const targetParent = parentId || "standalone";
+  const seq = ++sideBranchReqSeq;
+  const switchedParent = sideState.parentId !== targetParent;
+  sideState.parentId = targetParent;
+  if (switchedParent && !selectSideId) {
+    resetSideDraft(false);
+  }
+  try {
+    const branches = await request(`${sessionPath(targetParent)}/side-chats`);
+    if (seq !== sideBranchReqSeq) return;
+    sideState.branches = Array.isArray(branches) ? branches : [];
+    if (selectSideId) {
+      sideState.sideId = selectSideId;
+    } else if (sideState.sideId && !sideState.branches.some((b) => b.id === sideState.sideId)) {
+      sideState.sideId = null;
+      sideState.messages = [];
+    }
+    renderSideBranches();
+  } catch {
+    if (seq !== sideBranchReqSeq) return;
+    sideState.branches = [];
+    renderSideBranches();
+  }
+}
+
+async function selectSideBranch(sideId) {
+  if (!sideId) {
+    resetSideDraft(false);
+    elements["side-prompt"].focus();
+    return;
+  }
+  showSideError();
+  try {
+    const detail = await request(`/api/side-chats/${encodeURIComponent(sideId)}`);
+    sideState.sideId = detail.id;
+    sideState.messages = Array.isArray(detail.messages) ? detail.messages : [];
+    setSideQuote(detail.quote || "");
+    renderSideBranches();
+    renderSideConversation();
+    updateSideComposer();
+    elements["side-prompt"].focus();
+  } catch (error) {
+    showSideError(error.message || "无法加载该侧边分支。");
+  }
+}
+
+async function deleteActiveSideBranch() {
+  if (!sideState.sideId || sideState.pending) return;
+  const targetId = sideState.sideId;
+  showSideError();
+  try {
+    await request(`/api/side-chats/${encodeURIComponent(targetId)}`, { method: "DELETE" });
+    sideState.branches = sideState.branches.filter((b) => b.id !== targetId);
+    resetSideDraft(false);
+  } catch (error) {
+    showSideError(error.message || "删除侧边分支失败。");
+  }
+}
+
+function setSidePanel(open) {
+  sideState.open = Boolean(open);
+  elements["side-panel"].hidden = !sideState.open;
+  elements.workspace.dataset.sideOpen = String(sideState.open);
+  elements["toggle-side"].setAttribute("aria-expanded", String(sideState.open));
+  if (sideState.open) {
+    void loadSideBranches(currentParentSessionId(), sideState.sideId || "");
+    renderSideConversation();
+    updateSideComposer();
+    elements["side-prompt"].focus();
+  }
+}
+
+function updateSideComposer() {
+  const busy = sideState.pending;
+  elements["side-prompt"].readOnly = busy;
+  elements["side-send"].disabled = busy || !selectedModel() || !elements["side-prompt"].value.trim();
+  elements["side-send"].textContent = busy ? "思考中" : "发送";
+  elements["clear-side"].disabled = busy;
+  elements["side-branch-select"].disabled = busy;
+  elements["delete-side-branch"].disabled = busy;
+}
+
+function renderSideConversation() {
+  const list = elements["side-conversation"];
+  const hasAny = sideState.messages.length > 0 || sideState.pending;
+  elements["side-empty"].hidden = hasAny;
+  list.hidden = !hasAny;
+
+  const rows = [];
+  let tools = [];
+  for (const msg of sideState.messages) {
+    if (msg.role === "tool") {
+      tools.push(msg);
+      continue;
+    }
+    if (msg.intermediate) continue;
+    if (tools.length) {
+      rows.push(toolDetails(tools));
+      tools = [];
+    }
+    if (msg.role === "user") {
+      rows.push(node("article", "side-msg user", msg.content));
+    } else if (msg.role === "assistant" && msg.content) {
+      const box = node("article", "side-msg assistant");
+      const reply = renderReply(msg.content);
+      if (msg.model_name) reply.append(node("div", "reply-model", `模型：${msg.model_name}`));
+      box.append(reply);
+      rows.push(box);
+    }
+  }
+  if (tools.length) rows.push(toolDetails(tools));
+  if (sideState.pending) {
+    if (sideState.streamTools.length) rows.push(toolDetails(sideState.streamTools));
+    const box = node("article", "side-msg assistant");
+    box.append(sideState.streamText ? renderReply(sideState.streamText) : node("div", "pending", "正在思考…"));
+    rows.push(box);
+  }
+  list.replaceChildren(...rows);
+  elements["side-viewport"].scrollTop = elements["side-viewport"].scrollHeight;
+}
+
+async function sendSideMessage(event) {
+  event.preventDefault();
+  const question = elements["side-prompt"].value.trim();
+  const activeModel = selectedModel();
+  if (!question || !activeModel || sideState.pending) return;
+
+  const previousMessages = [...sideState.messages];
+  const parentId = currentParentSessionId();
+  sideState.parentId = parentId;
+  sideState.messages.push({ role: "user", content: question });
+  sideState.pending = true;
+  sideState.streamText = "";
+  sideState.streamTools = [];
+  elements["side-prompt"].value = "";
+  showSideError();
+  renderSideBranches();
+  renderSideConversation();
+  updateSideComposer();
+
+  let streamCycle = 0;
+  let streamError = null;
+  let doneData = null;
+  try {
+    await consumeSSE(
+      "/api/side-chat/stream",
+      {
+        question,
+        quote: sideState.quote,
+        session_id: state.active?.id || null,
+        side_id: sideState.sideId,
+        provider: activeModel.provider,
+        model: activeModel.model,
+      },
+      {
+        session(data) {
+          if (data?.side_id) sideState.sideId = data.side_id;
+        },
+        delta(data) {
+          if (typeof data?.cycle === "number" && data.cycle !== streamCycle) {
+            streamCycle = data.cycle;
+            sideState.streamText = "";
+          }
+          if (typeof data?.content === "string" && data.content) {
+            sideState.streamText += data.content;
+            renderSideConversation();
+          }
+        },
+        tool(data) {
+          sideState.streamTools.push({
+            role: "tool",
+            tool_name: data?.tool_name || "工具",
+            content: formatStreamToolContent(data || {}),
+          });
+          sideState.streamText = "";
+          renderSideConversation();
+        },
+        done(data) {
+          doneData = data;
+        },
+        error(data) {
+          streamError = new Error(data?.error || "侧边追问失败，请重试。");
+        },
+      },
+    );
+    if (streamError) throw streamError;
+    if (doneData) {
+      if (doneData.side_id) sideState.sideId = doneData.side_id;
+      if (Array.isArray(doneData.messages)) {
+        sideState.messages = doneData.messages;
+      } else {
+        sideState.messages.push({
+          role: "assistant",
+          content: doneData.reply || sideState.streamText,
+          model_name: doneData.model_name || "",
+        });
+      }
+      await loadSideBranches(parentId, sideState.sideId || "");
+    } else if (sideState.streamText) {
+      sideState.messages.push({ role: "assistant", content: sideState.streamText, model_name: "" });
+    }
+  } catch (error) {
+    sideState.messages = previousMessages;
+    elements["side-prompt"].value = question;
+    showSideError(error.message || "侧边追问连接中断，请重试。");
+  } finally {
+    sideState.pending = false;
+    sideState.streamText = "";
+    sideState.streamTools = [];
+    renderSideBranches();
+    renderSideConversation();
+    updateSideComposer();
+    elements["side-prompt"].focus();
+  }
+}
+
+function getConversationSelection() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const text = sel.toString().trim();
+  if (!text) return null;
+  const range = sel.getRangeAt(0);
+  const container = range.commonAncestorContainer;
+  const host = container.nodeType === Node.TEXT_NODE ? container.parentElement : container;
+  if (!host || !elements.conversation.contains(host)) return null;
+  const rect = range.getBoundingClientRect();
+  if (!rect || (rect.width === 0 && rect.height === 0)) return null;
+  return { text, rect };
+}
+
+function hideSelectionToolbar() {
+  activeSelectionText = "";
+  elements["selection-toolbar"].hidden = true;
+}
+
+function updateSelectionToolbar() {
+  const found = getConversationSelection();
+  if (!found) {
+    hideSelectionToolbar();
+    return;
+  }
+  activeSelectionText = found.text;
+  const bar = elements["selection-toolbar"];
+  bar.hidden = false;
+  const barRect = bar.getBoundingClientRect();
+  const centerX = found.rect.left + found.rect.width / 2;
+  const left = Math.max(12, Math.min(window.innerWidth - barRect.width - 12, centerX - barRect.width / 2));
+  let top = found.rect.bottom + 8;
+  if (top + barRect.height + 12 > window.innerHeight) {
+    top = Math.max(12, found.rect.top - barRect.height - 8);
+  }
+  bar.style.left = `${Math.round(left)}px`;
+  bar.style.top = `${Math.round(top)}px`;
+}
+
+function triggerQuoteFromSelection(explicitText = "") {
+  const text = (explicitText || activeSelectionText || getConversationSelection()?.text || "").trim();
+  if (!text) return false;
+  setMainQuote(text);
+  hideSelectionToolbar();
+  window.getSelection()?.removeAllRanges();
+  elements.prompt.focus();
+  return true;
+}
+
+function triggerSideFromSelection(explicitText = "") {
+  const text = (explicitText || activeSelectionText || getConversationSelection()?.text || "").trim();
+  hideSelectionToolbar();
+  window.getSelection()?.removeAllRanges();
+  if (text) {
+    if (sideState.quote !== text && !sideState.pending) {
+      resetSideDraft(false);
+    }
+    setSideQuote(text);
+    setSidePanel(true);
+    return true;
+  }
+  setSidePanel(!sideState.open);
+  return true;
 }
 
 elements.composer.addEventListener("submit", sendMessage);
@@ -857,6 +1257,43 @@ elements["model-picker"].addEventListener("keydown", (event) => {
 document.addEventListener("pointerdown", (event) => {
   if (openPanel && !elements["model-picker"].contains(event.target)) setPickerPanel();
   if (!elements["context-usage"].contains(event.target)) setContextPopover(false);
+  if (!elements["selection-toolbar"].contains(event.target) && !elements.conversation.contains(event.target)) {
+    hideSelectionToolbar();
+  }
+});
+elements["selection-toolbar"].addEventListener("mousedown", (event) => event.preventDefault());
+elements["selection-quote"].addEventListener("click", () => triggerQuoteFromSelection());
+elements["selection-side"].addEventListener("click", () => triggerSideFromSelection());
+elements["clear-quote"].addEventListener("click", () => {
+  setMainQuote("");
+  elements.prompt.focus();
+});
+elements["toggle-side"].addEventListener("click", () => setSidePanel(!sideState.open));
+elements["close-side"].addEventListener("click", () => setSidePanel(false));
+elements["clear-side-quote"].addEventListener("click", () => setSideQuote(""));
+elements["clear-side"].addEventListener("click", () => {
+  resetSideDraft(false);
+  elements["side-prompt"].focus();
+});
+elements["side-branch-select"].addEventListener("change", (event) => {
+  void selectSideBranch(event.target.value);
+});
+elements["delete-side-branch"].addEventListener("click", () => {
+  void deleteActiveSideBranch();
+});
+elements["side-form"].addEventListener("submit", sendSideMessage);
+elements["side-prompt"].addEventListener("input", updateSideComposer);
+elements["side-prompt"].addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault();
+    if (!elements["side-send"].disabled) elements["side-form"].requestSubmit();
+  }
+});
+elements.conversation.addEventListener("mouseup", () => queueMicrotask(updateSelectionToolbar));
+elements.conversation.addEventListener("keyup", () => queueMicrotask(updateSelectionToolbar));
+elements.viewport.addEventListener("scroll", hideSelectionToolbar, { passive: true });
+document.addEventListener("selectionchange", () => {
+  if (!getConversationSelection()) hideSelectionToolbar();
 });
 elements["context-trigger"].addEventListener("click", () => {
   const open = elements["context-popover"].hidden;
@@ -865,6 +1302,154 @@ elements["context-trigger"].addEventListener("click", () => {
   if (open && contextUsage.failed) void refreshContextUsage(true);
 });
 elements["open-add-model"].addEventListener("click", openAddModel);
+
+/* ---- Customizations Token 预算监控与明细面板 ---- */
+const customizationCategoryColors = {
+  memory: "#7c5ce6",
+  rules: "#f59e0b",
+  skills: "#3b82f6",
+  builtin_tools: "#10b981",
+  mcp_tools: "#22c55e",
+};
+const customizationStatusLabels = {
+  included: "已注入",
+  demoted_to_pointer: "路径指针",
+  excluded: "已排除",
+};
+const expandedCustomizationCategories = new Set();
+
+function formatPercent(ratio) {
+  const pct = (Number(ratio) || 0) * 100;
+  if (pct > 0 && pct < 0.1) return "<0.1%";
+  return `${pct.toFixed(1)}%`;
+}
+
+function renderCustomizationsReport(report) {
+  const used = Number(report.used_tokens || 0);
+  const budget = Math.max(1, Number(report.budget_tokens || 20000));
+  const pctText = formatPercent(report.usage_ratio ?? used / budget);
+  elements["customizations-total"].textContent = `${used.toLocaleString()} / ${budget.toLocaleString()} tokens (${pctText})`;
+
+  const bar = elements["customizations-bar"];
+  bar.setAttribute("aria-valuenow", String(Math.min(100, Math.round((used / budget) * 100))));
+  const segments = [];
+  for (const cat of report.categories || []) {
+    if (!cat.tokens) continue;
+    const seg = node("span", "custom-progress-seg");
+    seg.style.width = `${Math.min(100, Math.max(0.6, (cat.tokens / budget) * 100))}%`;
+    seg.style.background = customizationCategoryColors[cat.category] || "#5d43b6";
+    seg.title = `${cat.label}: ${cat.tokens.toLocaleString()} tokens (${formatPercent(cat.ratio)})`;
+    segments.push(seg);
+  }
+  bar.replaceChildren(...segments);
+
+  const alerts = elements["customizations-alerts"];
+  const alertPills = [];
+  if (report.demoted_count > 0) {
+    alertPills.push(node("span", "custom-alert-pill demoted", `已降级为路径指针：${report.demoted_count} 项`));
+  }
+  if (report.excluded_count > 0) {
+    alertPills.push(node("span", "custom-alert-pill excluded", `超预算自动排除：${report.excluded_count} 项`));
+  }
+  alerts.hidden = alertPills.length === 0;
+  alerts.replaceChildren(...alertPills);
+
+  const container = elements["customizations-categories"];
+  const blocks = (report.categories || []).map((cat) => {
+    const block = node("div", "custom-cat-block");
+    const row = node("div", "custom-cat-row");
+    const meta = node("div", "custom-cat-meta");
+    const dot = node("span", "custom-cat-dot");
+    dot.style.background = customizationCategoryColors[cat.category] || "#5d43b6";
+    meta.append(
+      dot,
+      node("span", "custom-cat-name", cat.label),
+      node("span", "custom-cat-stats", `(${Number(cat.tokens || 0).toLocaleString()} tokens) ${formatPercent(cat.ratio)}`),
+    );
+
+    const toggle = node("button", "custom-toggle-btn");
+    toggle.type = "button";
+    const isExpanded = expandedCustomizationCategories.has(cat.category);
+    if (!cat.items || cat.items.length === 0) {
+      toggle.textContent = "暂无项目";
+      toggle.disabled = true;
+    } else {
+      const noun = cat.items.length === 1 ? "1 项" : `${cat.items.length} 项`;
+      toggle.textContent = isExpanded ? `收起明细（${noun}）` : `展开明细（${noun}）`;
+      toggle.setAttribute("aria-expanded", String(isExpanded));
+      toggle.addEventListener("click", () => {
+        if (expandedCustomizationCategories.has(cat.category)) {
+          expandedCustomizationCategories.delete(cat.category);
+        } else {
+          expandedCustomizationCategories.add(cat.category);
+        }
+        renderCustomizationsReport(report);
+      });
+    }
+    row.append(meta, toggle);
+    block.append(row);
+
+    if (isExpanded && cat.items && cat.items.length > 0) {
+      const list = node("div", "custom-breakdown-list");
+      for (const item of cat.items) {
+        const itemEl = node("div", "custom-item-row");
+        const top = node("div", "custom-item-top");
+        const right = node("div", "custom-item-right");
+        const badge = node(
+          "span",
+          `custom-status-badge ${item.status}`,
+          customizationStatusLabels[item.status] || item.status,
+        );
+        const tokenLabel = item.status === "included"
+          ? `${item.tokens.toLocaleString()} tokens (${formatPercent(item.ratio)})`
+          : `原 ${item.original_tokens.toLocaleString()} → ${item.tokens.toLocaleString()} tokens`;
+        right.append(badge, node("span", "", tokenLabel));
+        top.append(node("span", "custom-item-name", item.name), right);
+        itemEl.append(top);
+
+        const subParts = [];
+        if (item.source_path) subParts.push(item.source_path);
+        if (item.reason) subParts.push(item.reason);
+        else if (item.description) subParts.push(item.description);
+        if (subParts.length) {
+          itemEl.append(node("div", "custom-item-sub", subParts.join(" · ")));
+        }
+        list.append(itemEl);
+      }
+      block.append(list);
+    }
+    return block;
+  });
+  container.replaceChildren(...blocks);
+}
+
+async function loadCustomizationsUsage() {
+  elements["customizations-error"].hidden = true;
+  elements["customizations-total"].textContent = "正在计算…";
+  try {
+    const report = await request("/api/customizations/usage");
+    // 若有降级或排除项，自动展开对应分类，避免静默忽略
+    for (const cat of report.categories || []) {
+      if (cat.demoted_count > 0 || cat.excluded_count > 0) {
+        expandedCustomizationCategories.add(cat.category);
+      }
+    }
+    renderCustomizationsReport(report);
+  } catch (error) {
+    elements["customizations-total"].textContent = "读取失败";
+    elements["customizations-error"].textContent = error.message || "无法获取 Customizations 用量。";
+    elements["customizations-error"].hidden = false;
+  }
+}
+
+elements["open-customizations"].addEventListener("click", () => {
+  setPickerPanel();
+  setContextPopover(false);
+  elements["customizations-dialog"].showModal();
+  void loadCustomizationsUsage();
+});
+elements["refresh-customizations"].addEventListener("click", () => void loadCustomizationsUsage());
+elements["close-customizations"].addEventListener("click", () => elements["customizations-dialog"].close());
 elements["model-provider"].addEventListener("change", updateModelForm);
 elements["model-form"].addEventListener("submit", addModel);
 elements["cancel-model"].addEventListener("click", () => elements["model-dialog"].close());
@@ -891,7 +1476,25 @@ elements["open-sidebar"].addEventListener("click", () => setSidebar(true));
 elements["close-sidebar"].addEventListener("click", () => setSidebar(false, true));
 elements.backdrop.addEventListener("click", () => setSidebar(false, true));
 document.addEventListener("keydown", (event) => {
+  const mod = event.ctrlKey || event.metaKey;
+  if (mod && !event.shiftKey && !event.altKey) {
+    const key = event.key.toLowerCase();
+    if (key === "l") {
+      const sel = activeSelectionText || getConversationSelection()?.text || "";
+      if (sel) {
+        event.preventDefault();
+        triggerQuoteFromSelection(sel);
+      }
+      return;
+    }
+    if (key === "e") {
+      event.preventDefault();
+      triggerSideFromSelection();
+      return;
+    }
+  }
   if (event.key !== "Escape") return;
+  if (!elements["selection-toolbar"].hidden) hideSelectionToolbar();
   if (!elements["context-popover"].hidden) setContextPopover(false, true);
   if (elements.sidebar.dataset.open === "true") setSidebar(false, true);
 });

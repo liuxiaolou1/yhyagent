@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from app.application.ports import MemoryStore
+from app.application.ports import CustomizationStore, MemoryStore
 from app.config import Settings
 from app.domain import MemoryScope, Tool, ToolRiskLevel, ToolSpec
 
@@ -230,10 +230,55 @@ class TavilySearchTool(Tool):
         return json.dumps(items, ensure_ascii=False)
 
 
+class LoadSkillTool(Tool):
+    """本地技能按需读取工具（只读安全工具，主对话与侧边追问分支均可使用）。"""
+
+    def __init__(self, customization_store: CustomizationStore, *, user_id: str = "default") -> None:
+        self._customization_store = customization_store
+        self._user_id = user_id
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="load_skill",
+            description="按名称只读加载本地技能目录中对应的完整 SKILL.md 说明文档（渐进式披露）。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "技能名称或技能目录名",
+                    },
+                },
+                "required": ["name"],
+            },
+            risk_level=ToolRiskLevel.SAFE,
+        )
+
+    async def execute(self, arguments: dict[str, Any]) -> str:
+        name = str(arguments.get("name", "")).strip()
+        if not name:
+            raise ValueError("技能名称 name 不能为空")
+        found = await self._customization_store.read_skill_content(name, user_id=self._user_id)
+        if found is None:
+            return json.dumps({"found": False, "name": name, "error": f"未找到技能 `{name}`"}, ensure_ascii=False)
+        source_path, content = found
+        return json.dumps(
+            {
+                "found": True,
+                "name": name,
+                "source_path": source_path,
+                "content": content,
+            },
+            ensure_ascii=False,
+        )
+
+
 def build_default_tools(
     settings: Settings,
     *,
     memory_store: MemoryStore | None = None,
+    customization_store: CustomizationStore | None = None,
     user_id: str = "default",
 ) -> list[Tool]:
     """按配置组装默认工具集合。"""
@@ -241,6 +286,8 @@ def build_default_tools(
     if memory_store is not None:
         tools.append(RememberTool(memory_store, user_id=user_id))
         tools.append(SearchMemoryTool(memory_store, user_id=user_id))
+    if customization_store is not None:
+        tools.append(LoadSkillTool(customization_store, user_id=user_id))
     if settings.tools.tavily_api_key:
         tools.append(TavilySearchTool(settings.tools.tavily_api_key))
     return tools

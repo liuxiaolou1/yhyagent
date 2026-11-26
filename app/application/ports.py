@@ -12,7 +12,10 @@ from app.domain import (
     Message,
     ModelResponse,
     ReviewDecision,
+    RuleEntry,
     Session,
+    SideChat,
+    SkillSummary,
     ToolCall,
     ToolSpec,
 )
@@ -32,6 +35,18 @@ class SessionStore(Protocol):
     async def save(self, session: Session) -> None: ...
 
     async def list_sessions(self) -> list[Session]: ...
+
+
+class SideChatStore(Protocol):
+    """侧边问答分支持久化端口：与主会话隔离存储，绝不污染主会话。"""
+
+    async def get(self, side_id: str) -> SideChat | None: ...
+
+    async def save(self, side_chat: SideChat) -> None: ...
+
+    async def list_by_parent(self, parent_session_id: str) -> list[SideChat]: ...
+
+    async def delete(self, side_id: str) -> bool: ...
 
 
 class MemoryStore(Protocol):
@@ -72,6 +87,21 @@ class ContextCompressor(Protocol):
         previous_summary: str,
         messages: list[Message],
     ) -> str: ...
+
+
+class CustomizationStore(Protocol):
+    """本地规则与技能扩展读取端口（支持渐进式披露与按需加载完整 SKILL.md）。"""
+
+    async def load_rules(self, *, user_id: str = "default") -> list[RuleEntry]: ...
+
+    async def load_skills(self, *, user_id: str = "default") -> list[SkillSummary]: ...
+
+    async def read_skill_content(
+        self,
+        name: str,
+        *,
+        user_id: str = "default",
+    ) -> tuple[str, str] | None: ...
 
 
 class ToolReviewer(Protocol):
